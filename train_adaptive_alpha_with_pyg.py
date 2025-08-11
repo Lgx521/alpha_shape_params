@@ -5,6 +5,13 @@ from torch.distributions.normal import Normal
 from tqdm import tqdm
 import os
 import glob
+from torch.utils.tensorboard import SummaryWriter
+
+
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+save_directory = os.path.join(project_root, 'checkpoints')
+
 
 # --- 1. 核心依赖导入 ---
 try:
@@ -209,7 +216,7 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
     NUM_POINTS = 2048
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128
     LEARNING_RATE = 0.0003
     EPOCHS = 20
     REWARD_BASELINE_DECAY = 0.95
@@ -226,15 +233,21 @@ def main():
 
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH:
         print("="*80 + f"\nFATAL ERROR: Please update the SHAPENET_PATH variable in the code.\n" + "="*80); exit()
+
+    # Tensorboard Visualizer
+    writer = SummaryWriter('runs/adaptive_alpha_v3_experiment')
     
     model = PyG_PointNet2_Alpha_Predictor().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=20, pin_memory=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     # 引入学习率调度器，可以进一步稳定训练
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
 
     reward_baseline = -5.0 # 初始化一个更现实的基线
+
+    # Tensorboard Visualizer
+    global_step = 0
     
     print(f"Starting training on {DEVICE} with V3 reward weights: {REWARD_WEIGHTS_V3}")
     
@@ -286,10 +299,30 @@ def main():
             
             reward_baseline = REWARD_BASELINE_DECAY * reward_baseline + (1 - REWARD_BASELINE_DECAY) * avg_reward
             progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}", std=f"{current_std:.3f}")
+
+            # --- 3. <<< TENSORBOARD >>> 在每一步记录关键指标 ---
+            # 使用 global_step 作为 X 轴，确保图表连续
+            writer.add_scalar('Loss/train', loss.item(), global_step)
+            writer.add_scalar('Reward/average_reward', avg_reward, global_step)
+            writer.add_scalar('Reward/baseline', reward_baseline, global_step)
+            writer.add_scalar('Hyperparameters/learning_rate', optimizer.param_groups[0]['lr'], global_step)
+            writer.add_scalar('Hyperparameters/exploration_std', current_std, global_step)
+            
+            # 记录分布情况，对于调试非常有用
+            writer.add_histogram('Alphas/sampled_distribution', sampled_alphas_dense, global_step)
+            writer.add_histogram('Reward/advantage_distribution', advantage, global_step)
+
+            global_step += 1 # 更新全局步数
         
         scheduler.step() # 更新学习率
         if (epoch + 1) % 5 == 0 or (epoch + 1) == EPOCHS:
-            torch.save(model.state_dict(), f"advanced_model_v3_epoch_{epoch+1}.pth")
+            file_name = f"advanced_model_v3_epoch_{epoch+1}.pth"
+            save_path = os.path.join(save_directory, file_name)
+            torch.save(model.state_dict(), save_path)
+
+    # --- 4. <<< TENSORBOARD >>> 训练结束后关闭writer ---
+    writer.close()
+    print("Training finished. TensorBoard logs saved.")
 
 if __name__ == '__main__':
     main()
