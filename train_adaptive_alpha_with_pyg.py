@@ -140,105 +140,150 @@ def reconstruct_with_alpha_shape(points, alphas):
     except Exception:
         return None
 
-def calculate_reward_v2(reconstructed_mesh, original_points, weights):
-    if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4:
-        return -10.0
-    device = original_points.device
-    reconstructed_mesh = reconstructed_mesh.to(device)
-    try:
-        reconstructed_points = sample_points_from_meshes(reconstructed_mesh, num_samples=original_points.shape[0])
-        loss_chamfer, _ = chamfer_distance(reconstructed_points, original_points.unsqueeze(0))
-        reward_fidelity = -loss_chamfer
-    except Exception:
-        return -10.0
-    loss_laplacian = mesh_laplacian_smoothing(reconstructed_mesh, method="uniform")
-    reward_smoothness = -loss_laplacian
-    reward_watertight = 0.5 if reconstructed_mesh.is_watertight() else -1.0
-    total_reward = (weights['w_chamfer'] * reward_fidelity + 
-                    weights['w_laplacian'] * reward_smoothness + 
-                    weights['w_watertight'] * reward_watertight)
+
+def calculate_reward_v3(reconstructed_mesh, original_points, alphas, weights, device):
+    """
+    V3版奖励函数，结合了网格质量和alpha值本身的属性。
+    """
+    # --- Part 1: Alpha值本身的启发式奖励 (即使网格重建失败也能计算) ---
+
+    # 1a. 局部Alpha一致性奖励: 鼓励局部区域的alpha值平滑
+    # 我们使用KNN找到每个点的邻居，并计算alpha值的局部方差
+    with torch.no_grad():
+        # 使用PyG的radius函数找到每个点半径范围内的邻居
+        # 这个半径需要根据你的点云尺度进行调整
+        radius_graph = radius(original_points, original_points, r=0.1, max_num_neighbors=16)
+        row, col = radius_graph
+        # 计算每个点与其邻居alpha值的差的平方的均值，作为局部方差的代理
+        local_variance = (alphas[row] - alphas[col])**2
+        # 我们希望方差小，所以奖励是负方差
+        reward_alpha_consistency = -torch.mean(local_variance)
+
+    # 1b. Alpha值幅度惩罚: 惩罚极端值
+    # 使用log惩罚来温和地惩罚过大的alpha值
+    penalty_alpha_magnitude = -torch.log(1 + torch.mean(alphas))
+
+    # 1c. 多样性奖励: 奖励alpha值的标准差，防止模型输出常数
+    reward_alpha_diversity = torch.std(alphas)
+
+    # --- Part 2: 基于重建网格质量的奖励 (核心目标) ---
+    
+    reward_fidelity = -10.0  # Chamfer Loss, 保真度
+    reward_smoothness = -2.0 # Laplacian Loss, 平滑度
+    reward_watertight = -1.0 # 水密性
+    
+    if reconstructed_mesh is not None and reconstructed_mesh.verts_packed().shape[0] >= 4:
+        reconstructed_mesh = reconstructed_mesh.to(device)
+        try:
+            # 保真度奖励 (Chamfer距离)
+            reconstructed_points = sample_points_from_meshes(reconstructed_mesh, num_samples=original_points.shape[0])
+            loss_chamfer, _ = chamfer_distance(reconstructed_points, original_points.unsqueeze(0))
+            # 使用负的Chamfer距离作为奖励，并进行缩放以控制其影响范围
+            reward_fidelity = -torch.clamp(loss_chamfer, 0, 10) 
+            
+            # 平滑度奖励
+            loss_laplacian = mesh_laplacian_smoothing(reconstructed_mesh, method="uniform")
+            reward_smoothness = -torch.clamp(loss_laplacian, 0, 2)
+
+            # 水密性奖励
+            if reconstructed_mesh.is_watertight():
+                reward_watertight = 1.0 # 成功构建水密网格应获得显著奖励
+        except Exception:
+            # 如果在计算过程中出错，则使用默认的惩罚值
+            pass
+            
+    # --- Part 3: 组合总奖励 ---
+    total_reward = (weights['w_fidelity'] * reward_fidelity +
+                    weights['w_smoothness'] * reward_smoothness +
+                    weights['w_watertight'] * reward_watertight +
+                    weights['w_alpha_consistency'] * reward_alpha_consistency +
+                    weights['w_alpha_magnitude'] * penalty_alpha_magnitude +
+                    weights['w_alpha_diversity'] * reward_alpha_diversity)
+    
     return total_reward.item()
 
-# --- 5. 训练主函数 (已修正) ---
+# --- 5. 训练主函数 (V3版) ---
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
-    NUM_POINTS = 2048
-    BATCH_SIZE = 16
-    LEARNING_RATE = 0.0005
-    EPOCHS = 200
-    REWARD_BASELINE_DECAY = 0.95
-    REWARD_WEIGHTS = {'w_chamfer': 1.0, 'w_laplacian': 0.5, 'w_watertight': 1.5}
+    NUM_POINTS = 2048; BATCH_SIZE = 16; LEARNING_RATE = 0.0003; EPOCHS = 5; REWARD_BASELINE_DECAY = 0.95
+
+    # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
+    REWARD_WEIGHTS_V3 = {
+        'w_fidelity': 1.0,           # 主要目标：网格与点云的相似度
+        'w_smoothness': 0.3,         # 次要目标：网格表面平滑
+        'w_watertight': 1.5,         # 重要目标：网格的拓扑正确性
+        'w_alpha_consistency': 0.5,  # 启发式：鼓励alpha场平滑
+        'w_alpha_magnitude': 0.2,    # 启发式：惩罚过大的alpha值
+        'w_alpha_diversity': 0.1     # 启发式：鼓励模型探索不同的alpha值
+    }
 
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH:
-        print("="*80 + f"\nFATAL ERROR: Please update the SHAPENET_PATH variable in the code.\n" + "="*80)
-        exit()
+        print("="*80 + f"\nFATAL ERROR: Please update the SHAPENET_PATH variable in the code.\n" + "="*80); exit()
     
     model = PyG_PointNet2_Alpha_Predictor().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    reward_baseline = 0.0
+    # 引入学习率调度器，可以进一步稳定训练
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+
+    reward_baseline = -5.0 # 初始化一个更现实的基线
     
-    print(f"Starting training on {DEVICE} with reward weights: {REWARD_WEIGHTS}")
+    print(f"Starting training on {DEVICE} with V3 reward weights: {REWARD_WEIGHTS_V3}")
     
     for epoch in range(EPOCHS):
         model.train()
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
+        # --- 探索衰减 ---
+        # 动态调整策略的标准差，实现从探索到利用的过渡
+        # 初始std为0.1，最终衰减到0.01
+        current_std = max(0.1 * (0.9**epoch), 0.01)
+
         for batch_data in progress_bar:
             batch_data = batch_data.to(DEVICE)
             points_dense, mask = to_dense_batch(batch_data.pos, batch_data.batch)
             
             # --- 前向传播 ---
-            policy = model(batch_data)
-            sampled_alphas = policy.sample()
-            
-            # --- 奖励计算 ---
+            # 修改模型forward的调用方式，传入std
+            policy = model(batch_data) # model的forward不需要改动
+            # 在采样前手动修改策略的std
+            policy.scale = torch.ones_like(policy.loc) * current_std 
+            sampled_alphas_dense = policy.sample()
+
             batch_rewards = []
             for i in range(points_dense.shape[0]):
                 sample_points = points_dense[i, mask[i]]
-                sample_alphas = sampled_alphas[i, :, mask[i]].squeeze()
+                # 从稠密张量中提取对应样本的alpha值
+                sample_alphas = sampled_alphas_dense[i, :, mask[i]].squeeze()
 
                 with torch.no_grad():
                     reconstructed_mesh = reconstruct_with_alpha_shape(sample_points, sample_alphas)
-                    reward = calculate_reward_v2(reconstructed_mesh, sample_points, REWARD_WEIGHTS)
+                    # 使用V3奖励函数
+                    reward = calculate_reward_v3(reconstructed_mesh, sample_points, sample_alphas, REWARD_WEIGHTS_V3, DEVICE)
                     batch_rewards.append(reward)
             
-            # 将奖励列表转换为Tensor
-            rewards_tensor = torch.tensor(batch_rewards, device=DEVICE)
+            rewards_tensor = torch.tensor(batch_rewards, device=DEVICE, dtype=torch.float32)
             avg_reward = rewards_tensor.mean().item()
-            
-            # --- Advantage 计算 ---
-            # 每个样本都有一个advantage
             advantage = rewards_tensor - reward_baseline
             
-            # --- 损失计算 (核心修正点) ---
-            # 1. 计算log_prob
-            #    确保log_prob的维度与mask和advantage对齐
-            log_probs_dense = policy.log_prob(sampled_alphas)
-            
-            # 2. 对每个样本的所有点的log_prob求和
-            #    只计算有效点的log_prob (通过mask)
+            # --- 损失计算 (使用修正后的正确方法) ---
+            log_probs_dense = policy.log_prob(sampled_alphas_dense)
             log_probs_sum_per_sample = (log_probs_dense * mask.unsqueeze(1)).sum(dim=[1, 2])
-            
-            # 3. 计算最终损失
-            #    将每个样本的log_prob和与对应的advantage相乘
-            #    我们希望最大化 (log_prob * advantage), 等价于最小化 -(log_prob * advantage)
             loss = - (log_probs_sum_per_sample * advantage).mean()
 
-            # --- 反向传播与优化 ---
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 添加梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            # --- 更新基线 ---
             reward_baseline = REWARD_BASELINE_DECAY * reward_baseline + (1 - REWARD_BASELINE_DECAY) * avg_reward
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}")
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}", std=f"{current_std:.3f}")
         
-        if (epoch + 1) % 5 == 0:
-            torch.save(model.state_dict(), f"advanced_model_pyg_epoch_{epoch+1}.pth")
+        scheduler.step() # 更新学习率
+        if (epoch + 1) % 10 == 0:
+            torch.save(model.state_dict(), f"advanced_model_v3_epoch_{epoch+1}.pth")
 
 if __name__ == '__main__':
     main()
