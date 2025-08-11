@@ -206,7 +206,11 @@ def calculate_reward_v3(reconstructed_mesh, original_points, alphas, weights, de
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
-    NUM_POINTS = 2048; BATCH_SIZE = 16; LEARNING_RATE = 0.0003; EPOCHS = 5; REWARD_BASELINE_DECAY = 0.95
+    NUM_POINTS = 2048
+    BATCH_SIZE = 64
+    LEARNING_RATE = 0.0003
+    EPOCHS = 5
+    REWARD_BASELINE_DECAY = 0.95
 
     # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
     REWARD_WEIGHTS_V3 = {
@@ -223,7 +227,7 @@ def main():
     
     model = PyG_PointNet2_Alpha_Predictor().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     # 引入学习率调度器，可以进一步稳定训练
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
@@ -282,7 +286,7 @@ def main():
             progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}", std=f"{current_std:.3f}")
         
         scheduler.step() # 更新学习率
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == EPOCHS:
             torch.save(model.state_dict(), f"advanced_model_v3_epoch_{epoch+1}.pth")
 
 if __name__ == '__main__':
