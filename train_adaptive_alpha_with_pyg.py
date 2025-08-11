@@ -179,7 +179,9 @@ def calculate_reward_v3(reconstructed_mesh, original_points, alphas, weights, de
             reconstructed_points = sample_points_from_meshes(reconstructed_mesh, num_samples=original_points.shape[0])
             loss_chamfer, _ = chamfer_distance(reconstructed_points, original_points.unsqueeze(0))
             # 使用负的Chamfer距离作为奖励，并进行缩放以控制其影响范围
-            reward_fidelity = -torch.clamp(loss_chamfer, 0, 10) 
+            # reward_fidelity = -torch.clamp(loss_chamfer, 0, 10) 
+            reward_fidelity = -torch.log(1.0 + torch.clamp(loss_chamfer, 0, 100))
+
             
             # 平滑度奖励
             loss_laplacian = mesh_laplacian_smoothing(reconstructed_mesh, method="uniform")
@@ -209,17 +211,17 @@ def main():
     NUM_POINTS = 2048
     BATCH_SIZE = 64
     LEARNING_RATE = 0.0003
-    EPOCHS = 5
+    EPOCHS = 20
     REWARD_BASELINE_DECAY = 0.95
 
     # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
     REWARD_WEIGHTS_V3 = {
-        'w_fidelity': 1.0,           # 主要目标：网格与点云的相似度
-        'w_smoothness': 0.3,         # 次要目标：网格表面平滑
-        'w_watertight': 1.5,         # 重要目标：网格的拓扑正确性
-        'w_alpha_consistency': 0.5,  # 启发式：鼓励alpha场平滑
-        'w_alpha_magnitude': 0.2,    # 启发式：惩罚过大的alpha值
-        'w_alpha_diversity': 0.1     # 启发式：鼓励模型探索不同的alpha值
+        'w_fidelity': 0.6,           # 主要目标：网格与点云的相似度
+        'w_smoothness': 0.5,         # 次要目标：网格表面平滑
+        'w_watertight': 1.0,         # 重要目标：网格的拓扑正确性
+        'w_alpha_consistency': 1.5,  # 启发式：鼓励alpha场平滑
+        'w_alpha_magnitude': 0.4,    # 启发式：惩罚过大的alpha值
+        'w_alpha_diversity': 0.3     # 启发式：鼓励模型探索不同的alpha值
     }
 
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH:
