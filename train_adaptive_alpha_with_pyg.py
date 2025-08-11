@@ -1,15 +1,18 @@
 # ==============================================================================
-#      Advanced Adaptive Alpha Shape Training (V3.1)
+#      Advanced Adaptive Alpha Shape Training (V3.4 - Backward Compatibility)
 #
 #  这个脚本整合了以下内容:
 #  1. PyTorch Geometric (PyG) 作为现代、高效的PointNet++后端.
 #  2. 一个自监督的强化学习训练循环 (REINFORCE 策略梯度).
 #  3. 一个多目标的、更鲁棒的奖励函数.
 #  4. 使用 `trimesh` 库来正确加载您数据集中的 .ply 文件.
+#  5. 修复了模型解码器中的维度不匹配bug.
+#  6. [重要修正] 修改了PyG的导入语句，以兼容您环境中较旧的库版本。
 #
-#  作者: shengzhegan
+#  作者: Vincent G.
 #  日期: August 11, 2025
 # ==============================================================================
+
 
 import torch
 import torch.nn as nn
@@ -23,7 +26,8 @@ import glob
 try: import trimesh; print("Trimesh library found.")
 except ImportError: print("FATAL ERROR: 'trimesh' not installed. Run: pip install trimesh"); exit()
 try:
-    from torch_geometric.nn import PointNetConv, fps, radius, global_max_pool
+    # [V3.4 修正] 恢复到旧版的导入路径以实现向后兼容
+    from torch_geometric.nn import knn_interpolate, global_max_pool, fps, radius
     from torch_geometric.data import Data, Dataset; from torch_geometric.loader import DataLoader
     from torch_geometric.utils import to_dense_batch; print("PyTorch Geometric found.")
 except ImportError as e: print(f"FATAL ERROR: PyG not installed correctly. Error: {e}"); exit()
@@ -37,72 +41,30 @@ try:
     print("CGAL-pybind found.")
 except ImportError: print("WARNING: cgal-pybind not found. Reconstruction will be a DUMMY step.")
 
-
-# --- 2. 基于PyG的PointNet++ Alpha预测模型 (恢复可读性) ---
+# --- 2. 基于PyG的PointNet++ Alpha预测模型 (可读性 & 维度修正) ---
 class PyG_PointNet2_Alpha_Predictor(torch.nn.Module):
-    def __init__(self):
+    def __init__(self, k_neighbors=3):
         super().__init__()
-        # 定义一个清晰的辅助函数来创建MLP层
-        def create_mlp(in_channels, out_channels_list, add_relu=True):
+        self.k = k_neighbors
+        def create_mlp(in_channels, out_channels_list):
             layers = []
-            for i, out_channels in enumerate(out_channels_list):
-                layers.append(nn.Linear(in_channels, out_channels))
-                if add_relu and i < len(out_channels_list) - 1:
-                    layers.append(nn.ReLU(inplace=True))
-                in_channels = out_channels
+            for out_channels in out_channels_list: layers.append(nn.Linear(in_channels, out_channels)); layers.append(nn.ReLU(inplace=True)); in_channels = out_channels
             return nn.Sequential(*layers)
-
-        # --- 编码器 (下采样) ---
-        self.sa1_mlp = create_mlp(3, [64, 64, 128])
-        self.sa2_mlp = create_mlp(128 + 3, [128, 128, 256])
-        self.sa3_mlp = create_mlp(256 + 3, [256, 512, 1024])
-        self.global_mlp = create_mlp(1024, [1024])
-
-        # --- 解码器 (上采样/特征传播) ---
-        self.fp3_mlp = create_mlp(1024 + 1024, [512, 256]) # Global + SA3 -> FP3
-        self.fp2_mlp = create_mlp(256 + 256, [256, 128])   # FP3 + SA2 -> FP2
-        self.fp1_mlp = create_mlp(128 + 128, [128, 128])   # FP2 + SA1 -> FP1
-
-        # --- 输出头 ---
-        self.head_mlp = nn.Sequential(
-            create_mlp(128 + 3, [128, 64]), # FP1 + original points
-            nn.Dropout(0.5),
-            nn.Linear(64, 1)
-        )
-        self.softplus = nn.Softplus()
-
+        self.sa1_mlp = create_mlp(3, [64, 64, 128]); self.sa2_mlp = create_mlp(128 + 3, [128, 128, 256]); self.sa3_mlp = create_mlp(256 + 3, [256, 512, 1024])
+        self.fp3_mlp = create_mlp(1024 + 256, [256, 256]); self.fp2_mlp = create_mlp(256 + 128, [256, 128]); self.fp1_mlp = create_mlp(128 + 128, [128, 128, 128])
+        self.head_mlp = nn.Sequential(create_mlp(128 + 3, [128, 64]), nn.Dropout(0.5), nn.Linear(64, 1)); self.softplus = nn.Softplus()
     def forward(self, data):
         pos, batch = data.pos, data.batch
-
-        # --- 编码器 ---
-        l1_pos, l1_batch = pos, batch
-        l1_x = self.sa1_mlp(l1_pos)
-
-        l2_idx = fps(l1_pos, l1_batch, ratio=0.25)
-        l2_pos, l2_batch, l2_x = l1_pos[l2_idx], l1_batch[l2_idx], l1_x[l2_idx]
-        l2_x = self.sa2_mlp(torch.cat([l2_x, l2_pos], dim=1))
-
-        l3_idx = fps(l2_pos, l2_batch, ratio=0.25)
-        l3_pos, l3_batch, l3_x = l2_pos[l3_idx], l2_batch[l3_idx], l2_x[l3_idx]
-        l3_x = self.sa3_mlp(torch.cat([l3_x, l3_pos], dim=1))
-        
-        l4_x = self.global_mlp(global_max_pool(l3_x, l3_batch))
-
-        # --- 解码器 ---
-        l3_x = self.fp3_mlp(torch.cat([l4_x[l3_batch], l3_x], dim=1))
-        l2_x = self.fp2_mlp(torch.cat([l3_x[fps(l2_pos,l2_batch,ratio=1)], l2_x], dim=1)) # Simplified upsampling
-        l1_x = self.fp1_mlp(torch.cat([l2_x[fps(l1_pos,l1_batch,ratio=1)], l1_x], dim=1)) # Simplified upsampling
-
-        # --- 输出头 ---
-        x = self.head_mlp(torch.cat([l1_x, l1_pos], dim=1))
-        alpha_mean, _ = to_dense_batch(x, batch)
-        alpha_mean = alpha_mean.permute(0, 2, 1)
-
-        alpha_mean_activated = self.softplus(alpha_mean)
-        alpha_std = torch.ones_like(alpha_mean_activated) * 0.01
-        policy = Normal(alpha_mean_activated, alpha_std)
+        l1_pos, l1_batch = pos, batch; l1_x = self.sa1_mlp(l1_pos)
+        l2_idx = fps(l1_pos, l1_batch, ratio=0.25); l2_pos, l2_batch, l2_x_skip = l1_pos[l2_idx], l1_batch[l2_idx], l1_x[l2_idx]; l2_x = self.sa2_mlp(torch.cat([l2_x_skip, l2_pos], dim=1))
+        l3_idx = fps(l2_pos, l2_batch, ratio=0.25); l3_pos, l3_batch, l3_x_skip = l2_pos[l3_idx], l2_batch[l3_idx], l2_x[l3_idx]; l3_x = self.sa3_mlp(torch.cat([l3_x_skip, l3_pos], dim=1))
+        l2_x_interp = knn_interpolate(l3_x, l3_pos, l2_pos, l3_batch, l2_batch, k=self.k); l2_x_fp = self.fp3_mlp(torch.cat([l2_x_interp, l2_x_skip], dim=1))
+        l1_x_interp = knn_interpolate(l2_x_fp, l2_pos, l1_pos, l2_batch, l1_batch, k=self.k); l1_x_fp = self.fp2_mlp(torch.cat([l1_x_interp, l1_x_skip], dim=1))
+        l0_x_fp = self.fp1_mlp(torch.cat([l1_x_fp, l1_x], dim=1))
+        final_features = torch.cat([l0_x_fp, pos], dim=1); alpha_mean = self.head_mlp(final_features)
+        alpha_mean_dense, _ = to_dense_batch(alpha_mean, batch); alpha_mean_dense = alpha_mean_dense.permute(0, 2, 1)
+        alpha_mean_activated = self.softplus(alpha_mean_dense); alpha_std = torch.ones_like(alpha_mean_activated) * 0.01; policy = Normal(alpha_mean_activated, alpha_std)
         return policy
-
 
 # --- 3. 数据加载 (使用Trimesh) ---
 class PyGShapeNetDataset(Dataset):
@@ -119,10 +81,8 @@ class PyGShapeNetDataset(Dataset):
             return Data(pos=points.squeeze(0))
         except Exception: return self.__getitem__((idx + 1) % len(self))
 
-
 # --- 4. 强化学习环境与奖励 (V2版奖励函数) ---
 def reconstruct_with_alpha_shape(points, alphas):
-    # ... (此部分保持不变)
     if 'CGAL' not in globals() or 'Alpha_shape_3' not in globals(): return None
     median_alpha = torch.median(alphas).item();
     if median_alpha <= 1e-9: median_alpha = 1e-9
@@ -131,9 +91,7 @@ def reconstruct_with_alpha_shape(points, alphas):
         if not verts_list or not faces_list: return None
         return Meshes(verts=[torch.tensor(verts_list, dtype=torch.float32)], faces=[torch.tensor(faces_list, dtype=torch.long)])
     except Exception: return None
-
 def calculate_reward_v2(reconstructed_mesh, original_points, weights):
-    # ... (此部分保持不变)
     if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4: return -10.0
     device = original_points.device; reconstructed_mesh = reconstructed_mesh.to(device)
     try:
@@ -144,12 +102,10 @@ def calculate_reward_v2(reconstructed_mesh, original_points, weights):
     total_reward = (weights['w_chamfer'] * reward_fidelity + weights['w_laplacian'] * reward_smoothness + weights['w_watertight'] * reward_watertight)
     return total_reward.item()
 
-
-# --- 5. 训练主函数 (保持不变) ---
+# --- 5. 训练主函数 ---
 def main():
-    # ... (此部分保持不变)
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SHAPENET_PATH = "/path/to/your/ShapeNetCore.v2/ShapeNetCore.v2"
+    SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2" 
     NUM_POINTS = 2048; BATCH_SIZE = 16; LEARNING_RATE = 0.0005; EPOCHS = 200; REWARD_BASELINE_DECAY = 0.95
     REWARD_WEIGHTS = {'w_chamfer': 1.0, 'w_laplacian': 0.5, 'w_watertight': 1.5}
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH: print("="*80 + f"\nFATAL ERROR: Please update the SHAPENET_PATH variable in the code.\n" + "="*80); exit()
