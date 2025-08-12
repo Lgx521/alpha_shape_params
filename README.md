@@ -4,11 +4,6 @@ Utilizing Reinforcement learning
 
 ---
 
-Excellent point. Using Conda is a very common and robust workflow for managing complex deep learning dependencies.
-
-Here is the updated `README.md` file with instructions tailored for a Conda environment.
-
----
 
 # Adaptive Alpha Shape Inference and Visualization
 
