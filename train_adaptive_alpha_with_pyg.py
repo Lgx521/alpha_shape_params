@@ -33,10 +33,10 @@ try:
     from pytorch3d.loss import chamfer_distance, mesh_laplacian_smoothing
     from pytorch3d.ops import sample_points_from_meshes
     from pytorch3d.structures import Meshes
-    from pytorch3d.io.mitsuba import to_mitsuba
     print("PyTorch3D found.")
-except ImportError:
+except ImportError as e:
     print("FATAL ERROR: PyTorch3D not found. Run: pip install pytorch3d")
+    print(e)
     exit()
 try:
     from CGAL.CGAL_Kernel import Point_3
@@ -45,75 +45,91 @@ try:
 except ImportError:
     print("WARNING: cgal-pybind not found. Reconstruction will be a DUMMY step.")
 
-# --- 2. 基于PyG的PointNet++ Alpha预测模型 (保持不变) ---
+
+# --- 2. 基于PyG的PointNet++ Alpha预测模型 (V5 - 最终修正版) ---
+# 这个版本拥有一个逻辑正确、维度匹配、层次分明的U-Net架构。
 class PyG_PointNet2_Alpha_Predictor(torch.nn.Module):
     def __init__(self, k_neighbors=3):
         super().__init__()
         self.k = k_neighbors
 
-        # --- Set Abstraction (SA) Layers ---
-        self.sa1_mlp = nn.Sequential(nn.Linear(3, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True), nn.Linear(64, 128))
-        self.sa2_mlp = nn.Sequential(nn.Linear(128 + 3, 128), nn.ReLU(inplace=True), nn.Linear(128, 128), nn.ReLU(inplace=True), nn.Linear(128, 256))
-        self.sa3_mlp = nn.Sequential(nn.Linear(256 + 3, 256), nn.ReLU(inplace=True), nn.Linear(256, 512), nn.ReLU(inplace=True), nn.Linear(512, 1024))
+        # 定义一个清晰的辅助函数来创建MLP层
+        def create_mlp(in_channels, out_channels_list):
+            layers = []
+            for out_channels in out_channels_list:
+                layers.append(nn.Linear(in_channels, out_channels))
+                layers.append(nn.ReLU(inplace=True))
+                in_channels = out_channels
+            # 移除最后一个ReLU以获得原始的logits
+            return nn.Sequential(*layers[:-1])
 
-        # --- Feature Propagation (FP) Layers ---
-        self.fp3_mlp = nn.Sequential(nn.Linear(1024 + 256, 256), nn.ReLU(inplace=True), nn.Linear(256, 256))
-        self.fp2_mlp = nn.Sequential(nn.Linear(256 + 128, 256), nn.ReLU(inplace=True), nn.Linear(256, 128))
-        self.fp1_mlp = nn.Sequential(nn.Linear(128 + 128, 128), nn.ReLU(inplace=True), nn.Linear(128, 128), nn.ReLU(inplace=True), nn.Linear(128, 128))
+        # --- 编码器 (SA) Layers ---
+        # 每一层MLP处理的是 [(上一层特征), (当前层坐标)]
+        self.sa1_mlp = create_mlp(3, [64, 64, 128])
+        self.sa2_mlp = create_mlp(128 + 3, [128, 128, 256])
+        self.sa3_mlp = create_mlp(256 + 3, [256, 512, 1024])
 
-        # --- Head MLP ---
-        self.head_mlp = nn.Sequential(nn.Linear(128 + 3, 128), nn.ReLU(inplace=True), nn.Linear(128, 64), nn.ReLU(inplace=True), nn.Dropout(0.5), nn.Linear(64, 1))
+        # --- 解码器 (FP) Layers ---
+        # 每一层MLP处理的是 [(插值后的上层特征), (本层跳跃连接的特征)]
+        # [V5 修正] 维度与forward函数中的标准U-Net逻辑完全匹配
+        self.fp3_mlp = create_mlp(1024 + 256, [256, 256])  # l3_up(1024) + l2_skip(256)
+        self.fp2_mlp = create_mlp(256 + 128, [256, 128])   # l2_fp(256) + l1_skip(128)
+        self.fp1_mlp = create_mlp(128 + 3, [128, 128, 128])# l1_fp(128) + l0_coords(3)
+
+        # --- 输出头 ---
+        self.head_mlp = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(64, 1)
+        )
         self.softplus = nn.Softplus()
 
     def forward(self, data):
         pos, batch = data.pos, data.batch
+
+        # --- 编码器 (Encoder) ---
+        # 保存每一层的特征和坐标，用于后续的跳跃连接
+        
+        # Level 0 (原始输入)
         l0_pos, l0_batch = pos, batch
-
-        # --- Set Abstraction ---
-        l0_features_sa1 = self.sa1_mlp(l0_pos)
+        
+        # Level 1
         l1_idx = fps(l0_pos, l0_batch, ratio=0.25)
-        l1_pos, l1_batch, l1_skip_features = l0_pos[l1_idx], l0_batch[l1_idx], l0_features_sa1[l1_idx]
-        l1_features = self.sa2_mlp(torch.cat([l1_skip_features, l1_pos], dim=1))
+        l1_pos, l1_batch = l0_pos[l1_idx], l0_batch[l1_idx]
+        # l1_skip_features 来自于对原始坐标的处理
+        l1_skip_features = F.relu(self.sa1_mlp(l1_pos))
+
+        # Level 2
         l2_idx = fps(l1_pos, l1_batch, ratio=0.25)
-        l2_pos, l2_batch, l2_skip_features = l1_pos[l2_idx], l1_batch[l2_idx], l1_features[l2_idx]
-        l2_features = self.sa3_mlp(torch.cat([l2_skip_features, l2_pos], dim=1))
-
-        # --- Feature Propagation ---
-        # **【重要提示】** 原始代码在这里的维度拼接存在逻辑上的小问题，但不影响主流程。
-        # fp3_mlp的输入应该是l1_interp_features和l1_skip_features，但原始代码使用了l1_features。
-        # 考虑到原始模型设计，此处暂时保持不变，但这是一个可以优化的点。
-        # l1_interp_features = knn_interpolate(l2_features, l2_pos, l1_pos, l2_batch, l1_batch, k=self.k)
-        # l1_fp_input = torch.cat([l1_interp_features, l1_features], dim=1)
-        # l1_fp_features = self.fp3_mlp(l1_fp_input)
-
-        # l0_interp_features = knn_interpolate(l1_fp_features, l1_pos, l0_pos, l1_batch, l0_batch, k=self.k)
-        # l0_fp_input = torch.cat([l0_interp_features, l0_features_sa1], dim=1)
-        # l0_fp_features = self.fp2_mlp(l0_fp_input)
-
-        # final_fp_input = torch.cat([l0_fp_features, l0_features_sa1], dim=1)
-        # final_features = self.fp1_mlp(final_fp_input)
-
-
-        # --- Feature Propagation (使用标准的U-Net跳跃连接) ---
-        # l2 -> l1
-        l1_interp_features = knn_interpolate(l2_features, l2_pos, l1_pos, l2_batch, l1_batch, k=self.k)
-        # 将上采样的特征与l1的“跳跃连接”特征拼接
-        l1_fp_features = self.fp3_mlp(torch.cat([l1_interp_features, l1_skip_features], dim=1))
-
-        # l1 -> l0
+        l2_pos, l2_batch = l1_pos[l2_idx], l1_batch[l2_idx]
+        # l2_skip_features 来自于对l1特征的处理
+        l2_skip_features = F.relu(self.sa2_mlp(torch.cat([l1_skip_features[l2_idx], l2_pos], dim=1)))
+        
+        # Level 3 (最深层)
+        l3_idx = fps(l2_pos, l2_batch, ratio=0.25)
+        l3_pos, l3_batch = l2_pos[l3_idx], l2_batch[l3_idx]
+        l3_features = F.relu(self.sa3_mlp(torch.cat([l2_skip_features[l3_idx], l3_pos], dim=1)))
+        
+        # --- 解码器 (Decoder) ---
+        
+        # FP for Level 2
+        l2_interp_features = knn_interpolate(l3_features, l3_pos, l2_pos, l3_batch, l2_batch, k=self.k)
+        l2_fp_features = F.relu(self.fp3_mlp(torch.cat([l2_interp_features, l2_skip_features], dim=1)))
+        
+        # FP for Level 1
+        l1_interp_features = knn_interpolate(l2_fp_features, l2_pos, l1_pos, l2_batch, l1_batch, k=self.k)
+        l1_fp_features = F.relu(self.fp2_mlp(torch.cat([l1_interp_features, l1_skip_features], dim=1)))
+        
+        # FP for Level 0 (原始点)
         l0_interp_features = knn_interpolate(l1_fp_features, l1_pos, l0_pos, l1_batch, l0_batch, k=self.k)
-        # 将上采样的特征与l0的“跳跃连接”特征拼接
-        l0_fp_features = self.fp2_mlp(torch.cat([l0_interp_features, l0_features_sa1], dim=1))
+        # 最后一层与原始坐标拼接
+        l0_fp_features = F.relu(self.fp1_mlp(torch.cat([l0_interp_features, l0_pos], dim=1)))
 
-        # 最后一层传播
-        final_features = self.fp1_mlp(l0_fp_features)
-
-
-        # --- Head ---
-        head_input = torch.cat([final_features, l0_pos], dim=1)
-        alpha_mean = self.head_mlp(head_input)
-
-        # --- Output Formatting ---
+        # --- 输出头 ---
+        alpha_mean = self.head_mlp(l0_fp_features)
+        
+        # --- 输出格式化 ---
         alpha_mean_dense, _ = to_dense_batch(alpha_mean, batch)
         alpha_mean_dense = alpha_mean_dense.permute(0, 2, 1)
         alpha_mean_activated = self.softplus(alpha_mean_dense)
@@ -228,9 +244,68 @@ def calculate_reward_v3(reconstructed_mesh, original_points, alphas, weights, de
     
     return total_reward.item()
 
+# def calculate_reward_v4(reconstructed_mesh, original_points, weights, device):
+#     """
+#     V4版奖励函数，基于拓扑分析，奖励有意义的几何组件。
+#     """
+#     # --- 1. 重建失败惩罚 ---
+#     if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4:
+#         return -10.0
+
+#     reconstructed_mesh = reconstructed_mesh.to(device)
+
+#     # --- 2. 拆分网格为连通组件 ---
+#     # 我们巧妙地使用to_mitsuba函数，它内部会进行连通组件拆分
+#     # 这是一个比自己写循环更高效、更鲁棒的方法
+#     try:
+#         # 这个函数会返回一个包含所有独立连通组件的列表
+#         components = to_mitsuba(reconstructed_mesh, "component")
+#     except Exception:
+#         # 如果拆分失败，说明网格质量极差
+#         return -10.0
+
+#     if not components:
+#         return -10.0
+
+#     # --- 3. 组件数量惩罚 ---
+#     # 如果网格过于破碎，给予温和惩罚。我们不希望有几百个小碎片。
+#     # 使用log来让惩罚不至于太剧烈
+#     reward_fragmentation = -torch.log(1.0 + torch.tensor(len(components), device=device))
+
+#     # --- 4. 找到并分析最大的组件 ---
+#     # 找到包含顶点数最多的那个组件
+#     largest_component = max(components, key=lambda m: m.verts_packed().shape[0])
+    
+#     # a. 尺寸奖励: 直接奖励最大组件的尺寸
+#     # 我们希望模型生成大的、有意义的结构
+#     reward_size = torch.log(1.0 + torch.tensor(largest_component.verts_packed().shape[0], device=device))
+
+#     # b. 保真度奖励 (只针对最大组件)
+#     try:
+#         component_points = sample_points_from_meshes(largest_component, num_samples=original_points.shape[0])
+#         loss_chamfer, _ = chamfer_distance(component_points, original_points.unsqueeze(0))
+#         # 用log代替线性惩罚，对小的误差更宽容，对大的误差惩罚更重
+#         reward_fidelity = -torch.log(1.0 + 10.0 * loss_chamfer) 
+#     except Exception:
+#         reward_fidelity = -5.0 # 如果采样失败，给予一个固定惩罚
+
+#     # c. 平滑度奖励 (只针对最大组件)
+#     loss_laplacian = mesh_laplacian_smoothing(largest_component, method="uniform")
+#     reward_smoothness = -torch.log(1.0 + loss_laplacian)
+    
+#     # --- 5. 组合总奖励 ---
+#     total_reward = (weights['w_fidelity'] * reward_fidelity +
+#                     weights['w_smoothness'] * reward_smoothness +
+#                     weights['w_size'] * reward_size +
+#                     weights['w_fragmentation'] * reward_fragmentation)
+
+#     return total_reward.item()
+
+
+
 def calculate_reward_v4(reconstructed_mesh, original_points, weights, device):
     """
-    V4版奖励函数，基于拓扑分析，奖励有意义的几何组件。
+    V4.1版奖励函数，使用手动实现的连通组件拆分，以兼容旧版PyTorch3D。
     """
     # --- 1. 重建失败惩罚 ---
     if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4:
@@ -238,40 +313,53 @@ def calculate_reward_v4(reconstructed_mesh, original_points, weights, device):
 
     reconstructed_mesh = reconstructed_mesh.to(device)
 
-    # --- 2. 拆分网格为连通组件 ---
-    # 我们巧妙地使用to_mitsuba函数，它内部会进行连通组件拆分
-    # 这是一个比自己写循环更高效、更鲁棒的方法
+    # --- 2. [重要更新] 手动拆分网格为连通组件 ---
+    # 这是您ROS代码中 cluster_connected_triangles 的PyTorch3D等价实现
     try:
-        # 这个函数会返回一个包含所有独立连通组件的列表
-        components = to_mitsuba(reconstructed_mesh, "component")
-    except Exception:
-        # 如果拆分失败，说明网格质量极差
-        return -10.0
+        # .get_mesh_verts_faces(0) 获取批次中第一个（也是唯一一个）网格的顶点和面
+        verts = reconstructed_mesh.verts_list()[0]
+        faces = reconstructed_mesh.faces_list()[0]
 
-    if not components:
+        # 使用trimesh来执行连通组件分析，因为它非常鲁棒
+        # 我们将PyTorch3D的网格数据临时转换成trimesh对象
+        mesh_trimesh = trimesh.Trimesh(vertices=verts.cpu().numpy(), faces=faces.cpu().numpy())
+        
+        # split()函数返回一个包含所有独立连通组件的trimesh对象列表
+        components_trimesh = mesh_trimesh.split(only_watertight=False)
+        
+        if not components_trimesh:
+            return -10.0 # 如果trimesh无法拆分或找不到组件
+        
+        # 将trimesh组件列表转换回PyTorch3D的Meshes对象列表
+        components = []
+        for comp_tm in components_trimesh:
+            comp_verts = torch.tensor(comp_tm.vertices, dtype=torch.float32, device=device)
+            comp_faces = torch.tensor(comp_tm.faces, dtype=torch.long, device=device)
+            components.append(Meshes(verts=[comp_verts], faces=[comp_faces]))
+
+    except Exception:
+        # 如果在拆分过程中出错，说明网格质量极差
         return -10.0
 
     # --- 3. 组件数量惩罚 ---
-    # 如果网格过于破碎，给予温和惩罚。我们不希望有几百个小碎片。
-    # 使用log来让惩罚不至于太剧烈
     reward_fragmentation = -torch.log(1.0 + torch.tensor(len(components), device=device))
 
     # --- 4. 找到并分析最大的组件 ---
-    # 找到包含顶点数最多的那个组件
-    largest_component = max(components, key=lambda m: m.verts_packed().shape[0])
-    
-    # a. 尺寸奖励: 直接奖励最大组件的尺寸
-    # 我们希望模型生成大的、有意义的结构
+    try:
+        largest_component = max(components, key=lambda m: m.verts_packed().shape[0])
+    except ValueError:
+        return -10.0 # 如果组件列表为空
+
+    # a. 尺寸奖励
     reward_size = torch.log(1.0 + torch.tensor(largest_component.verts_packed().shape[0], device=device))
 
     # b. 保真度奖励 (只针对最大组件)
     try:
         component_points = sample_points_from_meshes(largest_component, num_samples=original_points.shape[0])
         loss_chamfer, _ = chamfer_distance(component_points, original_points.unsqueeze(0))
-        # 用log代替线性惩罚，对小的误差更宽容，对大的误差惩罚更重
         reward_fidelity = -torch.log(1.0 + 10.0 * loss_chamfer) 
     except Exception:
-        reward_fidelity = -5.0 # 如果采样失败，给予一个固定惩罚
+        reward_fidelity = -5.0
 
     # c. 平滑度奖励 (只针对最大组件)
     loss_laplacian = mesh_laplacian_smoothing(largest_component, method="uniform")
@@ -293,7 +381,7 @@ def main():
     NUM_POINTS = 2048
     BATCH_SIZE = 64
     LEARNING_RATE = 0.0002
-    EPOCHS = 20
+    EPOCHS = 50
     REWARD_BASELINE_DECAY = 0.95
 
     # # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
@@ -315,7 +403,7 @@ def main():
     }
 
     # 设置要加载的检查点文件路径。如果文件不存在，则从头训练。
-    START_EPOCH = 10 # <-- 请修改为加载模型的epoch数
+    START_EPOCH = 0 # <-- 请修改为加载模型的epoch数
     file_name = f"advanced_model_v3_epoch_{START_EPOCH}.pth"
     CHECKPOINT_PATH = os.path.join(save_directory, file_name)
 
