@@ -1,63 +1,63 @@
-"""
-preprocess_shapenet.py
-将 train_data_dir / val_data_dir 中的网格文件（.ply/.obj）采样为固定点数（默认 1024），
-并保存为 preprocessed_train/*.pt, preprocessed_val/*.pt 供训练脚本高速读取。
-
-依赖: trimesh, pytorch3d
-"""
-
+# preprocess_shapenet.py
+import torch
+import trimesh
 import os
 import glob
-import torch
-import argparse
 from tqdm import tqdm
+from pytorch3d.ops import sample_points_from_meshes
+from pytorch3d.structures import Meshes
 
-try:
-    import trimesh
-    from pytorch3d.structures import Meshes
-    from pytorch3d.ops import sample_points_from_meshes
-except Exception as e:
-    raise RuntimeError("preprocessing requires trimesh and pytorch3d installed") from e
+# --- 配置您的路徑 ---
+SHAPENET_ROOT = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2" # 您的ShapeNet數據集根目錄
+OUTPUT_DIR = os.path.join(SHAPENET_ROOT, "processed_points_with_normals") # 預處理數據的存放位置
+NUM_POINTS = 2048 # 採樣點數，與訓練時保持一致
 
-def process_folder(src_folder, dst_folder, num_points=1024, overwrite=False):
-    os.makedirs(dst_folder, exist_ok=True)
-    mesh_files = sorted(glob.glob(os.path.join(src_folder, "*.ply")) + glob.glob(os.path.join(src_folder, "*.obj")))
-    if len(mesh_files) == 0:
-        print(f"No meshes in {src_folder}")
-        return
-    for mesh_path in tqdm(mesh_files, desc=f"Processing {src_folder}"):
-        name = os.path.splitext(os.path.basename(mesh_path))[0]
-        out_path = os.path.join(dst_folder, name + ".pt")
-        if os.path.exists(out_path) and not overwrite:
-            continue
-        try:
-            tm = trimesh.load(mesh_path, force='mesh')
-            if tm.is_empty:
-                print(f"Empty mesh: {mesh_path}, skipping")
-                continue
-            verts = torch.tensor(tm.vertices, dtype=torch.float32).unsqueeze(0)
-            faces = torch.tensor(tm.faces, dtype=torch.int64).unsqueeze(0)
-            mesh = Meshes(verts=verts, faces=faces)
-            points = sample_points_from_meshes(mesh, num_points)[0]  # (num_points,3)
-            # optionally center & normalize scale so all clouds are comparable
-            centroid = points.mean(dim=0, keepdim=True)
-            points = points - centroid
-            scale = torch.sqrt((points ** 2).sum(dim=1).max())
-            points = points / (scale + 1e-9)
-            torch.save(points, out_path)
-        except Exception as e:
-            print(f"Failed to process {mesh_path}: {e}")
+def process_and_save(path, output_dir):
+    try:
+        relative_path = os.path.relpath(os.path.dirname(path), SHAPENET_ROOT)
+        save_folder = os.path.join(output_dir, relative_path)
+        os.makedirs(save_folder, exist_ok=True)
+        save_path = os.path.join(save_folder, "points_and_normals.pt")
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train_folder", type=str, default="train_data_dir")
-    parser.add_argument("--val_folder", type=str, default="val_data_dir")
-    parser.add_argument("--out_train", type=str, default="preprocessed_train")
-    parser.add_argument("--out_val", type=str, default="preprocessed_val")
-    parser.add_argument("--num_points", type=int, default=1024)
-    parser.add_argument("--overwrite", action="store_true")
-    args = parser.parse_args()
+        if os.path.exists(save_path):
+            return
 
-    process_folder(args.train_folder, args.out_train, num_points=args.num_points, overwrite=args.overwrite)
-    process_folder(args.val_folder, args.out_val, num_points=args.num_points, overwrite=args.overwrite)
-    print("Preprocessing finished.")
+        mesh = trimesh.load(path, process=False)
+        if not hasattr(mesh, 'vertices') or not hasattr(mesh, 'faces') or len(mesh.vertices) == 0:
+            return
+
+        verts = torch.tensor(mesh.vertices, dtype=torch.float32)
+        faces = torch.tensor(mesh.faces, dtype=torch.long)
+        pytorch3d_mesh = Meshes(verts=[verts], faces=[faces])
+
+        points, normals = sample_points_from_meshes(
+            pytorch3d_mesh,
+            num_samples=NUM_POINTS,
+            return_normals=True
+        )
+
+        # 保存為包含點和法線的字典
+        data_dict = {'pos': points.squeeze(0), 'x': normals.squeeze(0)}
+        torch.save(data_dict, save_path)
+    except Exception as e:
+        print(f"處理 {path} 時出錯: {e}")
+
+if __name__ == '__main__':
+    if not os.path.isdir(SHAPENET_ROOT) or "path/to" in SHAPENET_ROOT:
+        print("致命錯誤: 請先在 preprocess_shapenet.py 中更新 SHAPENET_ROOT 路徑！")
+        exit()
+        
+    print(f"開始預處理數據，源目錄: {SHAPENET_ROOT}")
+    print(f"輸出目錄: {OUTPUT_DIR}")
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    paths = glob.glob(os.path.join(SHAPENET_ROOT, "**/model_normalized.ply"), recursive=True)
+    if not paths:
+        raise ValueError(f"在 {SHAPENET_ROOT} 中未找到 'model_normalized.ply' 文件。")
+        
+    print(f"找到 {len(paths)} 個模型，開始處理...")
+    
+    for path in tqdm(paths, desc="Preprocessing models"):
+        process_and_save(path, OUTPUT_DIR)
+        
+    print("預處理完成！")
