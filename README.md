@@ -1,5 +1,8 @@
 # Alpha shape params prediction
-Utilizing Reinforcement learning
+Utilizing Reinforcement learning  
+**NOTE**: This is still a immuture repo
+
+---
 
 Excellent point. Using Conda is a very common and robust workflow for managing complex deep learning dependencies.
 
