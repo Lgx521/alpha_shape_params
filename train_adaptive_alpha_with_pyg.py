@@ -132,7 +132,10 @@ class PyG_PointNet2_Alpha_Predictor(torch.nn.Module):
         # --- 输出格式化 ---
         alpha_mean_dense, _ = to_dense_batch(alpha_mean, batch)
         alpha_mean_dense = alpha_mean_dense.permute(0, 2, 1)
-        alpha_mean_activated = self.softplus(alpha_mean_dense)
+
+        MIN_ALPHA = 0.01 
+
+        alpha_mean_activated = self.softplus(alpha_mean_dense) + MIN_ALPHA
         alpha_std = torch.ones_like(alpha_mean_activated) * 0.01
         policy = Normal(alpha_mean_activated, alpha_std)
         
@@ -244,240 +247,162 @@ def calculate_reward_v3(reconstructed_mesh, original_points, alphas, weights, de
     
     return total_reward.item()
 
-# def calculate_reward_v4(reconstructed_mesh, original_points, weights, device):
-#     """
-#     V4版奖励函数，基于拓扑分析，奖励有意义的几何组件。
-#     """
-#     # --- 1. 重建失败惩罚 ---
-#     if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4:
-#         return -10.0
-
-#     reconstructed_mesh = reconstructed_mesh.to(device)
-
-#     # --- 2. 拆分网格为连通组件 ---
-#     # 我们巧妙地使用to_mitsuba函数，它内部会进行连通组件拆分
-#     # 这是一个比自己写循环更高效、更鲁棒的方法
-#     try:
-#         # 这个函数会返回一个包含所有独立连通组件的列表
-#         components = to_mitsuba(reconstructed_mesh, "component")
-#     except Exception:
-#         # 如果拆分失败，说明网格质量极差
-#         return -10.0
-
-#     if not components:
-#         return -10.0
-
-#     # --- 3. 组件数量惩罚 ---
-#     # 如果网格过于破碎，给予温和惩罚。我们不希望有几百个小碎片。
-#     # 使用log来让惩罚不至于太剧烈
-#     reward_fragmentation = -torch.log(1.0 + torch.tensor(len(components), device=device))
-
-#     # --- 4. 找到并分析最大的组件 ---
-#     # 找到包含顶点数最多的那个组件
-#     largest_component = max(components, key=lambda m: m.verts_packed().shape[0])
-    
-#     # a. 尺寸奖励: 直接奖励最大组件的尺寸
-#     # 我们希望模型生成大的、有意义的结构
-#     reward_size = torch.log(1.0 + torch.tensor(largest_component.verts_packed().shape[0], device=device))
-
-#     # b. 保真度奖励 (只针对最大组件)
-#     try:
-#         component_points = sample_points_from_meshes(largest_component, num_samples=original_points.shape[0])
-#         loss_chamfer, _ = chamfer_distance(component_points, original_points.unsqueeze(0))
-#         # 用log代替线性惩罚，对小的误差更宽容，对大的误差惩罚更重
-#         reward_fidelity = -torch.log(1.0 + 10.0 * loss_chamfer) 
-#     except Exception:
-#         reward_fidelity = -5.0 # 如果采样失败，给予一个固定惩罚
-
-#     # c. 平滑度奖励 (只针对最大组件)
-#     loss_laplacian = mesh_laplacian_smoothing(largest_component, method="uniform")
-#     reward_smoothness = -torch.log(1.0 + loss_laplacian)
-    
-#     # --- 5. 组合总奖励 ---
-#     total_reward = (weights['w_fidelity'] * reward_fidelity +
-#                     weights['w_smoothness'] * reward_smoothness +
-#                     weights['w_size'] * reward_size +
-#                     weights['w_fragmentation'] * reward_fragmentation)
-
-#     return total_reward.item()
-
-
-
-def calculate_reward_v4(reconstructed_mesh, original_points, weights, device):
+# --- 5. 全新奖励函数 (V5 - 可靠且高效) ---
+def calculate_reward_v5(alphas, original_points, k, weights, device):
     """
-    V4.1版奖励函数，使用手动实现的连通组件拆分，以兼容旧版PyTorch3D。
+    V5版奖励函数：不再依赖于重建，而是直接奖励alpha值与局部几何特征的相关性。
+    此函数绝对可靠，总能提供平滑的梯度。
+
+    Args:
+        alphas (torch.Tensor): 模型生成的alpha值 (N,)
+        original_points (torch.Tensor): 原始点云 (N, 3)
+        k (int): 用于计算局部密度的邻居数量
+        weights (dict): 奖励各部分的权重
+        device (torch.Tensor): 计算设备
+
+    Returns:
+        float: 计算出的总奖励值
     """
-    # --- 1. 重建失败惩罚 ---
-    if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4:
-        return -10.0
+    with torch.no_grad():
+        # --- Part 1: 计算每个点的局部几何特征 (邻居平均距离) ---
+        # 这是一个完美的“几何复杂度”代理：
+        # - 稀疏区域 -> 邻居距离远
+        # - 密集区域 -> 邻居距离近
 
-    reconstructed_mesh = reconstructed_mesh.to(device)
+        # 计算所有点对之间的距离矩阵 (N, N)
+        dist_matrix = torch.cdist(original_points.unsqueeze(0), original_points.unsqueeze(0)).squeeze(0)
 
-    # --- 2. [重要更新] 手动拆分网格为连通组件 ---
-    # 这是您ROS代码中 cluster_connected_triangles 的PyTorch3D等价实现
-    try:
-        # .get_mesh_verts_faces(0) 获取批次中第一个（也是唯一一个）网格的顶点和面
-        verts = reconstructed_mesh.verts_list()[0]
-        faces = reconstructed_mesh.faces_list()[0]
+        # 找到每个点最近的k个邻居的距离（topk(k+1)因为包括了自身，距离为0）
+        # 我们使用 largest=False 来获取最小的距离
+        knn_dists = torch.topk(dist_matrix, k + 1, dim=1, largest=False).values
 
-        # 使用trimesh来执行连通组件分析，因为它非常鲁棒
-        # 我们将PyTorch3D的网格数据临时转换成trimesh对象
-        mesh_trimesh = trimesh.Trimesh(vertices=verts.cpu().numpy(), faces=faces.cpu().numpy())
-        
-        # split()函数返回一个包含所有独立连通组件的trimesh对象列表
-        components_trimesh = mesh_trimesh.split(only_watertight=False)
-        
-        if not components_trimesh:
-            return -10.0 # 如果trimesh无法拆分或找不到组件
-        
-        # 将trimesh组件列表转换回PyTorch3D的Meshes对象列表
-        components = []
-        for comp_tm in components_trimesh:
-            comp_verts = torch.tensor(comp_tm.vertices, dtype=torch.float32, device=device)
-            comp_faces = torch.tensor(comp_tm.faces, dtype=torch.long, device=device)
-            components.append(Meshes(verts=[comp_verts], faces=[comp_faces]))
+        # 计算到k个邻居的平均距离（忽略自身，所以从第1个索引开始）
+        # 添加一个小的epsilon防止除以0（虽然不太可能）
+        local_geom_feature = torch.mean(knn_dists[:, 1:], dim=1)
 
-    except Exception:
-        # 如果在拆分过程中出错，说明网格质量极差
-        return -10.0
+        # --- Part 2: 标准化，让alpha和几何特征具有可比性 ---
+        # 将两个张量都进行min-max标准化到[0, 1]区间，消除尺度差异
+        def normalize(tensor):
+            return (tensor - tensor.min()) / (tensor.max() - tensor.min() + 1e-8)
 
-    # --- 3. 组件数量惩罚 ---
-    reward_fragmentation = -torch.log(1.0 + torch.tensor(len(components), device=device))
+        norm_alphas = normalize(alphas)
+        norm_geom_feature = normalize(local_geom_feature)
 
-    # --- 4. 找到并分析最大的组件 ---
-    try:
-        largest_component = max(components, key=lambda m: m.verts_packed().shape[0])
-    except ValueError:
-        return -10.0 # 如果组件列表为空
+    # --- Part 3: 计算核心奖励 ---
 
-    # a. 尺寸奖励
-    reward_size = torch.log(1.0 + torch.tensor(largest_component.verts_packed().shape[0], device=device))
-
-    # b. 保真度奖励 (只针对最大组件)
-    try:
-        component_points = sample_points_from_meshes(largest_component, num_samples=original_points.shape[0])
-        loss_chamfer, _ = chamfer_distance(component_points, original_points.unsqueeze(0))
-        reward_fidelity = -torch.log(1.0 + 10.0 * loss_chamfer) 
-    except Exception:
-        reward_fidelity = -5.0
-
-    # c. 平滑度奖励 (只针对最大组件)
-    loss_laplacian = mesh_laplacian_smoothing(largest_component, method="uniform")
-    reward_smoothness = -torch.log(1.0 + loss_laplacian)
+    # 3a. 相关性奖励 (核心！):
+    # 我们希望 norm_alphas 和 norm_geom_feature 的分布尽可能一致。
+    # 使用负的均方误差(MSE)来奖励它们之间的相似性。MSE越小，奖励越高。
+    # 这是最直接、最强大的学习信号。
+    reward_correlation = -F.mse_loss(norm_alphas, norm_geom_feature)
     
-    # --- 5. 组合总奖励 ---
-    total_reward = (weights['w_fidelity'] * reward_fidelity +
-                    weights['w_smoothness'] * reward_smoothness +
-                    weights['w_size'] * reward_size +
-                    weights['w_fragmentation'] * reward_fragmentation)
+    # 或者，可以使用余弦相似度，它更关注方向上的一致性（推荐）
+    # reward_correlation = F.cosine_similarity(norm_alphas, norm_geom_feature, dim=0)
+
+
+    # 3b. Alpha多样性奖励:
+    # 鼓励模型不要输出一个恒定的alpha值，而是根据几何形状进行探索。
+    # 标准差越大，说明模型输出的alpha值越丰富。
+    reward_diversity = torch.std(alphas)
+
+    # 3c. Alpha幅度温和惩罚:
+    # 防止alpha值爆炸性增长。使用log来温和地惩罚过大的均值。
+    penalty_magnitude = -torch.log(1 + torch.mean(alphas))
+
+    # --- Part 4: 组合总奖励 ---
+    total_reward = (weights['w_correlation'] * reward_correlation +
+                    weights['w_diversity'] * reward_diversity +
+                    weights['w_magnitude'] * penalty_magnitude)
 
     return total_reward.item()
 
 
-# --- 5. 训练主函数 (V3版) ---
+# --- 5. 训练主函数 (使用V5奖励) ---
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
     NUM_POINTS = 2048
     BATCH_SIZE = 64
-    LEARNING_RATE = 0.0002
+    LEARNING_RATE = 0.0003  # 可以从 2e-4 到 5e-4 之间尝试
     EPOCHS = 50
     REWARD_BASELINE_DECAY = 0.95
 
-    # # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
-    # REWARD_WEIGHTS_V3 = {
-    #     'w_fidelity': 0.6,           # 主要目标：网格与点云的相似度
-    #     'w_smoothness': 0.5,         # 次要目标：网格表面平滑
-    #     'w_watertight': 1.0,         # 重要目标：网格的拓扑正确性
-    #     'w_alpha_consistency': 1.5,  # 启发式：鼓励alpha场平滑
-    #     'w_alpha_magnitude': 0.4,    # 启发式：惩罚过大的alpha值
-    #     'w_alpha_diversity': 1.0     # 启发式：鼓励模型探索不同的alpha值
-    # }
-
-    # --- V4版奖励权重，专注于拓扑和主要组件 ---
-    REWARD_WEIGHTS_V4 = {
-        'w_fidelity': 1.5,      # 主要目标：最大组件与点云的相似度
-        'w_smoothness': 0.5,    # 次要目标：最大组件的表面平滑
-        'w_size': 1.0,          # 重要目标：奖励生成更大的主体结构
-        'w_fragmentation': 0.3, # 启发式：温和地惩罚过于破碎的网格
+    # --- V5版奖励权重 (全新，更可靠) ---
+    REWARD_WEIGHTS_V5 = {
+        'w_correlation': 2.0,  # 主要目标：让alpha分布匹配几何特征
+        'w_diversity': 0.5,    # 次要目标：鼓励alpha值的多样性，防止坍缩
+        'w_magnitude': 0.2,    # 启发式：温和地惩罚过大的alpha值
     }
-
-    # 设置要加载的检查点文件路径。如果文件不存在，则从头训练。
-    START_EPOCH = 0 # <-- 请修改为加载模型的epoch数
-    file_name = f"advanced_model_v3_epoch_{START_EPOCH}.pth"
-    CHECKPOINT_PATH = os.path.join(save_directory, file_name)
-
+    # V5奖励函数中K邻居参数
+    K_NEIGHBORS_FOR_REWARD = 16
 
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH:
         print("="*80 + f"\nFATAL ERROR: Please update the SHAPENET_PATH variable in the code.\n" + "="*80); exit()
 
+    # 设置检查点加载逻辑
+    START_EPOCH = 0
+    file_name = f"advanced_model_v3_epoch_{START_EPOCH}.pth" # 可以更新命名方案为v5
+    CHECKPOINT_PATH = os.path.join(save_directory, file_name)
+    
     # Tensorboard Visualizer
-    writer = SummaryWriter('runs/adaptive_alpha_v3_experiment')
+    writer = SummaryWriter('runs/adaptive_alpha_v5_experiment')
     
     model = PyG_PointNet2_Alpha_Predictor().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    # 引入学习率调度器，可以进一步稳定训练
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-
 
     if os.path.exists(CHECKPOINT_PATH):
         print(f"✅ Resuming training from checkpoint: {CHECKPOINT_PATH}")
-        # 加载模型的状态字典 (权重)
         model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
     else:
-        print("🟡 Checkpoint file not found. Starting training from scratch.")
-        # 如果找不到文件，就从epoch 0开始
+        print(f"🟡 Checkpoint file '{CHECKPOINT_PATH}' not found. Starting training from scratch.")
         START_EPOCH = 0
 
-    reward_baseline = -5.0 # 初始化一个更现实的基线
-
-    # Tensorboard Visualizer
+    # [重要] V5奖励的期望值更接近0，所以从0开始更合理
+    reward_baseline = 0.0
     global_step = 0
     
-    # print(f"Starting training on {DEVICE} with V3 reward weights: {REWARD_WEIGHTS_V3}")
-    print(f"Starting training on {DEVICE} with V4 reward weights: {REWARD_WEIGHTS_V4}")
+    print(f"Starting training on {DEVICE} with V5 reward weights: {REWARD_WEIGHTS_V5}")
     
     for epoch in range(START_EPOCH, EPOCHS):
         model.train()
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
-        # --- 探索衰减 ---
-        # 动态调整策略的标准差，实现从探索到利用的过渡
-        # 初始std为0.1，最终衰减到0.01
-        current_std = max(0.15 * (0.96**epoch), 0.01)
+        # 探索衰减: 初始标准差可以设得高一些以鼓励探索
+        current_std = max(0.20 * (0.96**epoch), 0.01)
 
         for batch_data in progress_bar:
             batch_data = batch_data.to(DEVICE)
             points_dense, mask = to_dense_batch(batch_data.pos, batch_data.batch)
             
-            # --- 前向传播 ---
-            # 修改模型forward的调用方式，传入std
-            policy = model(batch_data) # model的forward不需要改动
-            # 在采样前手动修改策略的std
+            policy = model(batch_data)
             policy.scale = torch.ones_like(policy.loc) * current_std 
             sampled_alphas_dense = policy.sample()
 
             batch_rewards = []
             for i in range(points_dense.shape[0]):
+                # 提取出当前样本的有效点和对应的alpha值
                 sample_points = points_dense[i, mask[i]]
-                # 从稠密张量中提取对应样本的alpha值
                 sample_alphas = sampled_alphas_dense[i, :, mask[i]].squeeze()
 
-                with torch.no_grad():
-                    reconstructed_mesh = reconstruct_with_alpha_shape(sample_points, sample_alphas)
-                    # 使用V3奖励函数
-                    # reward = calculate_reward_v3(reconstructed_mesh, sample_points, sample_alphas, REWARD_WEIGHTS_V3, DEVICE)
-                    reward = calculate_reward_v4(reconstructed_mesh, sample_points, REWARD_WEIGHTS_V4, DEVICE)
-                    batch_rewards.append(reward)
+                # [!!! 核心变化 !!!]
+                # 不再进行耗时且不稳定的重建
+                # 直接调用 V5 奖励函数
+                reward = calculate_reward_v5(sample_alphas, 
+                                             sample_points, 
+                                             K_NEIGHBORS_FOR_REWARD, 
+                                             REWARD_WEIGHTS_V5, 
+                                             DEVICE)
+                batch_rewards.append(reward)
             
             rewards_tensor = torch.tensor(batch_rewards, device=DEVICE, dtype=torch.float32)
             avg_reward = rewards_tensor.mean().item()
             advantage = rewards_tensor - reward_baseline
             
-            # --- 损失计算 (使用修正后的正确方法) ---
             log_probs_dense = policy.log_prob(sampled_alphas_dense)
+            # 根据mask确保只计算有效点的log_prob
             log_probs_sum_per_sample = (log_probs_dense * mask.unsqueeze(1)).sum(dim=[1, 2])
             loss = - (log_probs_sum_per_sample * advantage).mean()
 
@@ -487,31 +412,32 @@ def main():
             optimizer.step()
             
             reward_baseline = REWARD_BASELINE_DECAY * reward_baseline + (1 - REWARD_BASELINE_DECAY) * avg_reward
-            progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}", std=f"{current_std:.3f}")
+            progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}")
 
-            # --- 3. <<< TENSORBOARD >>> 在每一步记录关键指标 ---
-            # 使用 global_step 作为 X 轴，确保图表连续
+            # --- Tensorboard Logging ---
             writer.add_scalar('Loss/train', loss.item(), global_step)
             writer.add_scalar('Reward/average_reward', avg_reward, global_step)
             writer.add_scalar('Reward/baseline', reward_baseline, global_step)
             writer.add_scalar('Hyperparameters/learning_rate', optimizer.param_groups[0]['lr'], global_step)
             writer.add_scalar('Hyperparameters/exploration_std', current_std, global_step)
-            
-            # 记录分布情况，对于调试非常有用
-            writer.add_histogram('Alphas/sampled_distribution', sampled_alphas_dense, global_step)
+            writer.add_histogram('Alphas/sampled_distribution', sampled_alphas_dense[mask.unsqueeze(1).expand_as(sampled_alphas_dense)], global_step)
             writer.add_histogram('Reward/advantage_distribution', advantage, global_step)
 
-            global_step += 1 # 更新全局步数
+            global_step += 1
         
-        scheduler.step() # 更新学习率
+        scheduler.step()
+        
+        # 每5个epoch保存一次模型
         if (epoch + 1) % 5 == 0 or (epoch + 1) == EPOCHS:
-            file_name = f"advanced_model_v3_epoch_{epoch+1}.pth"
-            save_path = os.path.join(save_directory, file_name)
+            # 建议更新模型命名以反映新的策略
+            save_file_name = f"advanced_model_v5_epoch_{epoch+1}.pth"
+            save_path = os.path.join(save_directory, save_file_name)
             torch.save(model.state_dict(), save_path)
+            print(f"\n✅ Model saved to {save_path}")
 
-    # --- 4. <<< TENSORBOARD >>> 训练结束后关闭writer ---
     writer.close()
     print("Training finished. TensorBoard logs saved.")
+
 
 if __name__ == '__main__':
     main()
