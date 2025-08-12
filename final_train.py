@@ -128,21 +128,35 @@ class PointNetAlphaUNet(torch.nn.Module):
 # --- 3. 高效數據加載器 ---
 class PyGShapeNetDataset(Dataset):
     def __init__(self, root_dir, num_points=2048, split='train'):
-        self.processed_dir = os.path.join(root_dir, "processed_points_with_normals")
+        super().__init__(root_dir)
+
+        # self.processed_dir = os.path.join(root_dir, "processed_points_with_normals")
+        # self.num_points = num_points
+        # self.paths = glob.glob(os.path.join(self.processed_dir, "**/*.pt"), recursive=True)
+        
+        # if not self.paths:
+        #     raise ValueError(f"在 '{self.processed_dir}' 中未找到預處理的 '.pt' 文件。\n"
+        #                      "請先運行 'preprocess_shapenet.py' 腳本。")
+        # print(f"為 '{split}' 找到了 {len(self.paths)} 個預處理好的模型。")
+
+        # self.root 会由父类自动设置为 root_dir
+        self.processed_data_folder = os.path.join(self.root, "processed_points_with_normals")
         self.num_points = num_points
-        self.paths = glob.glob(os.path.join(self.processed_dir, "**/*.pt"), recursive=True)
+        self.paths = glob.glob(os.path.join(self.processed_data_folder, "**/*.pt"), recursive=True)
         
         if not self.paths:
-            raise ValueError(f"在 '{self.processed_dir}' 中未找到預處理的 '.pt' 文件。\n"
-                             "請先運行 'preprocess_shapenet.py' 腳本。")
-        print(f"為 '{split}' 找到了 {len(self.paths)} 個預處理好的模型。")
+            raise ValueError(f"在 '{self.processed_data_folder}' 中未找到预处理的 '.pt' 文件。\n"
+                             "请再次确认：\n"
+                             "1. 您已经成功运行了 'preprocess_shapenet.py' 脚本。\n"
+                             "2. 当前脚本中的 SHAPENET_PATH 路径设置正确无误。")
+        print(f"为 '{split}' 分割找到了 {len(self.paths)} 个预处理好的模型。")
         
     def __len__(self):
         return len(self.paths)
         
     def __getitem__(self, idx):
         try:
-            data_dict = torch.load(self.paths[idx])
+            data_dict = torch.load(self.paths[idx], weights_only=False)
             return Data(pos=data_dict['pos'], x=data_dict['x'])
         except Exception:
             return self.__getitem__((idx + 1) % len(self))
@@ -183,7 +197,7 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
     NUM_POINTS = 2048
-    BATCH_SIZE = 128  # 可以適當調大，因為數據加載很快
+    BATCH_SIZE = 256  # 可以適當調大，因為數據加載很快
     LEARNING_RATE = 3e-4
     EPOCHS = 100
     REWARD_BASELINE_DECAY = 0.95
@@ -272,7 +286,7 @@ def main():
         
         scheduler.step()
         
-        if (epoch + 1) % 10 == 0 or (epoch + 1) == EPOCHS:
+        if (epoch + 1) % 5 == 0 or (epoch + 1) == EPOCHS:
             save_file_name = f"pointnet_alpha_v6_epoch_{epoch+1}.pth"
             save_path = os.path.join(save_directory, save_file_name)
             torch.save(model.state_dict(), save_path)
