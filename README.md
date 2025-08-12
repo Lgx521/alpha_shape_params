@@ -1,4 +1,7 @@
-# Adaptive Alpha Shape Inference and Visualization
+# Alpha shape params prediction
+Utilizing Reinforcement learning
+
+## Adaptive Alpha Shape Inference and Visualization
 
 This script provides a powerful tool to visualize the output of a trained PointNet++ model designed to predict per-point alpha values for 3D surface reconstruction. It loads a point cloud from the ShapeNet dataset, runs inference to get the alpha values, and displays a side-by-side comparison of the input points, an alpha value heatmap, and the final reconstructed mesh using Open3D's alpha shape algorithm.
 
