@@ -33,6 +33,7 @@ try:
     from pytorch3d.loss import chamfer_distance, mesh_laplacian_smoothing
     from pytorch3d.ops import sample_points_from_meshes
     from pytorch3d.structures import Meshes
+    from pytorch3d.io.mitsuba import to_mitsuba
     print("PyTorch3D found.")
 except ImportError:
     print("FATAL ERROR: PyTorch3D not found. Run: pip install pytorch3d")
@@ -81,16 +82,32 @@ class PyG_PointNet2_Alpha_Predictor(torch.nn.Module):
         # **【重要提示】** 原始代码在这里的维度拼接存在逻辑上的小问题，但不影响主流程。
         # fp3_mlp的输入应该是l1_interp_features和l1_skip_features，但原始代码使用了l1_features。
         # 考虑到原始模型设计，此处暂时保持不变，但这是一个可以优化的点。
+        # l1_interp_features = knn_interpolate(l2_features, l2_pos, l1_pos, l2_batch, l1_batch, k=self.k)
+        # l1_fp_input = torch.cat([l1_interp_features, l1_features], dim=1)
+        # l1_fp_features = self.fp3_mlp(l1_fp_input)
+
+        # l0_interp_features = knn_interpolate(l1_fp_features, l1_pos, l0_pos, l1_batch, l0_batch, k=self.k)
+        # l0_fp_input = torch.cat([l0_interp_features, l0_features_sa1], dim=1)
+        # l0_fp_features = self.fp2_mlp(l0_fp_input)
+
+        # final_fp_input = torch.cat([l0_fp_features, l0_features_sa1], dim=1)
+        # final_features = self.fp1_mlp(final_fp_input)
+
+
+        # --- Feature Propagation (使用标准的U-Net跳跃连接) ---
+        # l2 -> l1
         l1_interp_features = knn_interpolate(l2_features, l2_pos, l1_pos, l2_batch, l1_batch, k=self.k)
-        l1_fp_input = torch.cat([l1_interp_features, l1_features], dim=1)
-        l1_fp_features = self.fp3_mlp(l1_fp_input)
+        # 将上采样的特征与l1的“跳跃连接”特征拼接
+        l1_fp_features = self.fp3_mlp(torch.cat([l1_interp_features, l1_skip_features], dim=1))
 
+        # l1 -> l0
         l0_interp_features = knn_interpolate(l1_fp_features, l1_pos, l0_pos, l1_batch, l0_batch, k=self.k)
-        l0_fp_input = torch.cat([l0_interp_features, l0_features_sa1], dim=1)
-        l0_fp_features = self.fp2_mlp(l0_fp_input)
+        # 将上采样的特征与l0的“跳跃连接”特征拼接
+        l0_fp_features = self.fp2_mlp(torch.cat([l0_interp_features, l0_features_sa1], dim=1))
 
-        final_fp_input = torch.cat([l0_fp_features, l0_features_sa1], dim=1)
-        final_features = self.fp1_mlp(final_fp_input)
+        # 最后一层传播
+        final_features = self.fp1_mlp(l0_fp_features)
+
 
         # --- Head ---
         head_input = torch.cat([final_features, l0_pos], dim=1)
@@ -211,6 +228,64 @@ def calculate_reward_v3(reconstructed_mesh, original_points, alphas, weights, de
     
     return total_reward.item()
 
+def calculate_reward_v4(reconstructed_mesh, original_points, weights, device):
+    """
+    V4版奖励函数，基于拓扑分析，奖励有意义的几何组件。
+    """
+    # --- 1. 重建失败惩罚 ---
+    if reconstructed_mesh is None or reconstructed_mesh.verts_packed().shape[0] < 4:
+        return -10.0
+
+    reconstructed_mesh = reconstructed_mesh.to(device)
+
+    # --- 2. 拆分网格为连通组件 ---
+    # 我们巧妙地使用to_mitsuba函数，它内部会进行连通组件拆分
+    # 这是一个比自己写循环更高效、更鲁棒的方法
+    try:
+        # 这个函数会返回一个包含所有独立连通组件的列表
+        components = to_mitsuba(reconstructed_mesh, "component")
+    except Exception:
+        # 如果拆分失败，说明网格质量极差
+        return -10.0
+
+    if not components:
+        return -10.0
+
+    # --- 3. 组件数量惩罚 ---
+    # 如果网格过于破碎，给予温和惩罚。我们不希望有几百个小碎片。
+    # 使用log来让惩罚不至于太剧烈
+    reward_fragmentation = -torch.log(1.0 + torch.tensor(len(components), device=device))
+
+    # --- 4. 找到并分析最大的组件 ---
+    # 找到包含顶点数最多的那个组件
+    largest_component = max(components, key=lambda m: m.verts_packed().shape[0])
+    
+    # a. 尺寸奖励: 直接奖励最大组件的尺寸
+    # 我们希望模型生成大的、有意义的结构
+    reward_size = torch.log(1.0 + torch.tensor(largest_component.verts_packed().shape[0], device=device))
+
+    # b. 保真度奖励 (只针对最大组件)
+    try:
+        component_points = sample_points_from_meshes(largest_component, num_samples=original_points.shape[0])
+        loss_chamfer, _ = chamfer_distance(component_points, original_points.unsqueeze(0))
+        # 用log代替线性惩罚，对小的误差更宽容，对大的误差惩罚更重
+        reward_fidelity = -torch.log(1.0 + 10.0 * loss_chamfer) 
+    except Exception:
+        reward_fidelity = -5.0 # 如果采样失败，给予一个固定惩罚
+
+    # c. 平滑度奖励 (只针对最大组件)
+    loss_laplacian = mesh_laplacian_smoothing(largest_component, method="uniform")
+    reward_smoothness = -torch.log(1.0 + loss_laplacian)
+    
+    # --- 5. 组合总奖励 ---
+    total_reward = (weights['w_fidelity'] * reward_fidelity +
+                    weights['w_smoothness'] * reward_smoothness +
+                    weights['w_size'] * reward_size +
+                    weights['w_fragmentation'] * reward_fragmentation)
+
+    return total_reward.item()
+
+
 # --- 5. 训练主函数 (V3版) ---
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -221,14 +296,22 @@ def main():
     EPOCHS = 20
     REWARD_BASELINE_DECAY = 0.95
 
-    # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
-    REWARD_WEIGHTS_V3 = {
-        'w_fidelity': 0.6,           # 主要目标：网格与点云的相似度
-        'w_smoothness': 0.5,         # 次要目标：网格表面平滑
-        'w_watertight': 1.0,         # 重要目标：网格的拓扑正确性
-        'w_alpha_consistency': 1.5,  # 启发式：鼓励alpha场平滑
-        'w_alpha_magnitude': 0.4,    # 启发式：惩罚过大的alpha值
-        'w_alpha_diversity': 1.0     # 启发式：鼓励模型探索不同的alpha值
+    # # --- V3版奖励权重 (这是新的关键超参数，需要仔细调整) ---
+    # REWARD_WEIGHTS_V3 = {
+    #     'w_fidelity': 0.6,           # 主要目标：网格与点云的相似度
+    #     'w_smoothness': 0.5,         # 次要目标：网格表面平滑
+    #     'w_watertight': 1.0,         # 重要目标：网格的拓扑正确性
+    #     'w_alpha_consistency': 1.5,  # 启发式：鼓励alpha场平滑
+    #     'w_alpha_magnitude': 0.4,    # 启发式：惩罚过大的alpha值
+    #     'w_alpha_diversity': 1.0     # 启发式：鼓励模型探索不同的alpha值
+    # }
+
+    # --- V4版奖励权重，专注于拓扑和主要组件 ---
+    REWARD_WEIGHTS_V4 = {
+        'w_fidelity': 1.5,      # 主要目标：最大组件与点云的相似度
+        'w_smoothness': 0.5,    # 次要目标：最大组件的表面平滑
+        'w_size': 1.0,          # 重要目标：奖励生成更大的主体结构
+        'w_fragmentation': 0.3, # 启发式：温和地惩罚过于破碎的网格
     }
 
     # 设置要加载的检查点文件路径。如果文件不存在，则从头训练。
@@ -265,7 +348,8 @@ def main():
     # Tensorboard Visualizer
     global_step = 0
     
-    print(f"Starting training on {DEVICE} with V3 reward weights: {REWARD_WEIGHTS_V3}")
+    # print(f"Starting training on {DEVICE} with V3 reward weights: {REWARD_WEIGHTS_V3}")
+    print(f"Starting training on {DEVICE} with V4 reward weights: {REWARD_WEIGHTS_V4}")
     
     for epoch in range(START_EPOCH, EPOCHS):
         model.train()
@@ -296,7 +380,8 @@ def main():
                 with torch.no_grad():
                     reconstructed_mesh = reconstruct_with_alpha_shape(sample_points, sample_alphas)
                     # 使用V3奖励函数
-                    reward = calculate_reward_v3(reconstructed_mesh, sample_points, sample_alphas, REWARD_WEIGHTS_V3, DEVICE)
+                    # reward = calculate_reward_v3(reconstructed_mesh, sample_points, sample_alphas, REWARD_WEIGHTS_V3, DEVICE)
+                    reward = calculate_reward_v4(reconstructed_mesh, sample_points, REWARD_WEIGHTS_V4, DEVICE)
                     batch_rewards.append(reward)
             
             rewards_tensor = torch.tensor(batch_rewards, device=DEVICE, dtype=torch.float32)
