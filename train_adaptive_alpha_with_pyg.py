@@ -216,8 +216,8 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
     NUM_POINTS = 2048
-    BATCH_SIZE = 128
-    LEARNING_RATE = 0.0003
+    BATCH_SIZE = 64
+    LEARNING_RATE = 0.0002
     EPOCHS = 20
     REWARD_BASELINE_DECAY = 0.95
 
@@ -228,8 +228,14 @@ def main():
         'w_watertight': 1.0,         # 重要目标：网格的拓扑正确性
         'w_alpha_consistency': 1.5,  # 启发式：鼓励alpha场平滑
         'w_alpha_magnitude': 0.4,    # 启发式：惩罚过大的alpha值
-        'w_alpha_diversity': 0.3     # 启发式：鼓励模型探索不同的alpha值
+        'w_alpha_diversity': 1.0     # 启发式：鼓励模型探索不同的alpha值
     }
+
+    # 设置要加载的检查点文件路径。如果文件不存在，则从头训练。
+    START_EPOCH = 10 # <-- 请修改为加载模型的epoch数
+    file_name = f"advanced_model_v3_epoch_{START_EPOCH}.pth"
+    CHECKPOINT_PATH = os.path.join(save_directory, file_name)
+
 
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH:
         print("="*80 + f"\nFATAL ERROR: Please update the SHAPENET_PATH variable in the code.\n" + "="*80); exit()
@@ -239,10 +245,20 @@ def main():
     
     model = PyG_PointNet2_Alpha_Predictor().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=20, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     # 引入学习率调度器，可以进一步稳定训练
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+
+
+    if os.path.exists(CHECKPOINT_PATH):
+        print(f"✅ Resuming training from checkpoint: {CHECKPOINT_PATH}")
+        # 加载模型的状态字典 (权重)
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=DEVICE))
+    else:
+        print("🟡 Checkpoint file not found. Starting training from scratch.")
+        # 如果找不到文件，就从epoch 0开始
+        START_EPOCH = 0
 
     reward_baseline = -5.0 # 初始化一个更现实的基线
 
@@ -251,14 +267,14 @@ def main():
     
     print(f"Starting training on {DEVICE} with V3 reward weights: {REWARD_WEIGHTS_V3}")
     
-    for epoch in range(EPOCHS):
+    for epoch in range(START_EPOCH, EPOCHS):
         model.train()
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         
         # --- 探索衰减 ---
         # 动态调整策略的标准差，实现从探索到利用的过渡
         # 初始std为0.1，最终衰减到0.01
-        current_std = max(0.1 * (0.9**epoch), 0.01)
+        current_std = max(0.15 * (0.96**epoch), 0.01)
 
         for batch_data in progress_bar:
             batch_data = batch_data.to(DEVICE)
