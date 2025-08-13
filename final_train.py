@@ -156,9 +156,28 @@ class PyGShapeNetDataset(Dataset):
         
     def __getitem__(self, idx):
         try:
+            # 1. 加载原始数据
             data_dict = torch.load(self.paths[idx], weights_only=False)
-            return Data(pos=data_dict['pos'], x=data_dict['x'])
-        except Exception:
+            points = data_dict['pos']
+            normals = data_dict['x']
+
+            # 2. 对点云进行中心化和尺度归一化
+            # 计算中心点
+            center = points.mean(dim=0)
+            # 平移到原点
+            points_centered = points - center
+            # 计算缩放因子 (到原点的最远距离)
+            scale = (points_centered.norm(p=2, dim=1)).max() * 2
+            # 缩放到0.5m半径球内
+            points_normalized = points_centered / scale
+
+            # 3. 返回归一化后的数据
+            # 注意：法线是方向向量，不需要平移和缩放
+            return Data(pos=points_normalized, x=normals)
+        
+        except Exception as e:
+            print(f"警告：加载或处理文件 {self.paths[idx]} 失败，跳过。错误: {e}")
+            # 如果加载失败，则尝试加载下一个
             return self.__getitem__((idx + 1) % len(self))
 
 # --- 4. 高效GPU版獎勵函數 (V6) ---
