@@ -37,7 +37,7 @@ except ImportError:
 
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-save_directory = os.path.join(project_root, 'checkpoints_v6')
+save_directory = os.path.join(project_root, 'checkpoints_v6_1')
 os.makedirs(save_directory, exist_ok=True)
 
 
@@ -167,7 +167,7 @@ class PyGShapeNetDataset(Dataset):
             # 平移到原点
             points_centered = points - center
             # 计算缩放因子 (到原点的最远距离)
-            scale = (points_centered.norm(p=2, dim=1)).max() * 2
+            scale = (points_centered.norm(p=2, dim=1)).max()
             # 缩放到0.5m半径球内
             points_normalized = points_centered / scale
 
@@ -217,15 +217,15 @@ def main():
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
     NUM_POINTS = 2048
     BATCH_SIZE = 256  # 可以適當調大，因為數據加載很快
-    LEARNING_RATE = 3e-4
+    LEARNING_RATE = 1e-4
     EPOCHS = 100
     REWARD_BASELINE_DECAY = 0.95
     K_NEIGHBORS_FOR_REWARD = 16
-    EXPLORATION_DECAY = 0.96 # 探索率衰減
+    EXPLORATION_DECAY = 0.98 # 探索率衰減
 
     REWARD_WEIGHTS = {
         'w_correlation': 2.5,
-        'w_diversity': 0.5,
+        'w_diversity': 0.1,
         'w_magnitude': 0.2,
     }
 
@@ -236,9 +236,11 @@ def main():
     
     model = PointNetAlphaUNet().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=10, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16, pin_memory=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.7)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.7)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(dataloader) * EPOCHS, eta_min=1e-6)
+
 
     START_EPOCH = 0
     # 可選的檢查點加載
@@ -274,7 +276,7 @@ def main():
                                                  K_NEIGHBORS_FOR_REWARD, 
                                                  REWARD_WEIGHTS, 
                                                  DEVICE)
-            
+            rewards_tensor.clamp_(-5, 5)
             avg_reward = rewards_tensor.mean().item()
             advantage = rewards_tensor - reward_baseline
             
@@ -287,6 +289,8 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+
+            scheduler.step()
             
             reward_baseline = REWARD_BASELINE_DECAY * reward_baseline + (1 - REWARD_BASELINE_DECAY) * avg_reward
             progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}")
@@ -303,7 +307,7 @@ def main():
 
             global_step += 1
         
-        scheduler.step()
+        # scheduler.step()
         
         if (epoch + 1) % 5 == 0 or (epoch + 1) == EPOCHS:
             save_file_name = f"pointnet_alpha_v6_epoch_{epoch+1}.pth"
