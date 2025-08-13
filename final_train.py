@@ -8,6 +8,11 @@ import os
 import glob
 from torch.utils.tensorboard import SummaryWriter
 
+training_version = 'v6_2'
+'''
+This version v6 2 added advantage normalization
+'''
+
 # --- 1. 核心依賴導入 ---
 try:
     from torch_geometric.nn import knn_interpolate, fps, knn_graph
@@ -37,7 +42,7 @@ except ImportError:
 
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-save_directory = os.path.join(project_root, 'checkpoints_v6_1')
+save_directory = os.path.join(project_root, f'checkpoints_{training_version}')
 os.makedirs(save_directory, exist_ok=True)
 
 
@@ -168,7 +173,7 @@ class PyGShapeNetDataset(Dataset):
             points_centered = points - center
             # 计算缩放因子 (到原点的最远距离)
             scale = (points_centered.norm(p=2, dim=1)).max()
-            # 缩放到0.5m半径球内
+            # 缩放到单位球内
             points_normalized = points_centered / scale
 
             # 3. 返回归一化后的数据
@@ -232,7 +237,7 @@ def main():
     if not os.path.isdir(SHAPENET_PATH) or "/path/to/your/" in SHAPENET_PATH:
         print("="*80 + f"\n致命錯誤: 請在腳本中更新 SHAPENET_PATH 變量。\n" + "="*80); exit()
 
-    writer = SummaryWriter('runs/pointnet_alpha_v6_experiment')
+    writer = SummaryWriter(f'runs/pointnet_alpha_{training_version}_experiment')
     
     model = PointNetAlphaUNet().to(DEVICE)
     dataset = PyGShapeNetDataset(root_dir=SHAPENET_PATH, num_points=NUM_POINTS)
@@ -279,6 +284,7 @@ def main():
             rewards_tensor.clamp_(-5, 5)
             avg_reward = rewards_tensor.mean().item()
             advantage = rewards_tensor - reward_baseline
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
             
             log_probs_dense = policy.log_prob(sampled_alphas_dense)
             log_probs_sum_per_sample = (log_probs_dense * mask.unsqueeze(1)).sum(dim=[1, 2])
@@ -310,7 +316,7 @@ def main():
         # scheduler.step()
         
         if (epoch + 1) % 5 == 0 or (epoch + 1) == EPOCHS:
-            save_file_name = f"pointnet_alpha_v6_epoch_{epoch+1}.pth"
+            save_file_name = f"pointnet_alpha_{training_version}_epoch_{epoch+1}.pth"
             save_path = os.path.join(save_directory, save_file_name)
             torch.save(model.state_dict(), save_path)
             print(f"\n✅ 模型已保存至 {save_path}")
