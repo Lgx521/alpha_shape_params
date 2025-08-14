@@ -7,6 +7,8 @@ from tqdm import tqdm
 import os
 import glob
 from torch.utils.tensorboard import SummaryWriter
+import multiprocessing
+
 
 # ==============================================================================
 # --- 版本与实验配置 ---
@@ -17,6 +19,7 @@ training_version = 'v8'
 v7: 采用基于CGAL的真实重建奖励。
 v8: 将重建引擎从CGAL替换为易于安装的alphashape包，以解决安装问题。
     - 牺牲了部分计算速度，换取了开发和部署的便利性。
+    - 太慢了。。。。。。。。
 '''
 
 # --- 1. 核心依赖导入 ---
@@ -115,26 +118,41 @@ class PyGShapeNetDataset(Dataset):
             return self.__getitem__((idx + 1) % len(self))
 
 # --- 4. 全新奖励函数 (V8 - 基于alphashape) ---
-def calculate_reconstruction_reward_v8_alphashape(alphas, points, weights, device):
+def calculate_reconstruction_reward_v8_cpu(args):
+    """
+    一个“工人”函数，设计为被多进程池调用。
+    它接收CPU张量，并在CPU上完成所有计算，返回一个标量奖励。
+    """
+    # 从传入的元组中解包参数
+    alphas, points, weights = args
+    
     try:
-        points_np = points.cpu().numpy()
+        # alphashape需要numpy数组
+        points_np = points.numpy()
         median_alpha = torch.median(alphas).item()
         if median_alpha <= 1e-9: median_alpha = 1e-9
+        
         mesh_alphashape = alphashape.alphashape(points_np, median_alpha)
+        
         if not hasattr(mesh_alphashape, 'faces') or len(mesh_alphashape.faces) == 0:
-            return torch.tensor(-10.0, device=device)
-        verts_tensor = torch.tensor(mesh_alphashape.vertices, dtype=torch.float32, device=device)
-        faces_tensor = torch.tensor(mesh_alphashape.faces, dtype=torch.long, device=device)
-        reconstructed_mesh = Meshes(verts=[verts_tensor], faces=[faces_tensor])
-    except Exception:
-        return torch.tensor(-10.0, device=device)
+            return torch.tensor(-10.0) # 返回CPU张量
 
+        # 所有计算都在CPU上进行
+        verts_tensor = torch.tensor(mesh_alphashape.vertices, dtype=torch.float32)
+        faces_tensor = torch.tensor(mesh_alphashape.faces, dtype=torch.long)
+        reconstructed_mesh = Meshes(verts=[verts_tensor], faces=[faces_tensor])
+
+    except Exception:
+        return torch.tensor(-10.0)
+
+    # pytorch3d的函数也可以在CPU上运行
     with torch.no_grad():
         sampled_points_from_recon = sample_points_from_meshes(reconstructed_mesh, num_samples=points.shape[0])
         chamfer_loss, _ = chamfer_distance(sampled_points_from_recon, points.unsqueeze(0))
         reward_fidelity = -chamfer_loss
         smoothness_penalty = mesh_laplacian_smoothing(reconstructed_mesh)
         reward_smoothness = -smoothness_penalty
+        
     total_reward = (weights['w_fidelity'] * reward_fidelity + weights['w_smoothness'] * reward_smoothness)
     return total_reward
 
@@ -143,13 +161,14 @@ def main():
     # --- 超参数配置 ---
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
-    NUM_POINTS = 2048
-    BATCH_SIZE = 64
+    NUM_POINTS = 1024
+    BATCH_SIZE = 32
     LEARNING_RATE = 5e-5
     EPOCHS = 100
     REWARD_BASELINE_DECAY = 0.95
     EXPLORATION_DECAY = 0.98
     REWARD_WEIGHTS = {'w_fidelity': 100.0, 'w_smoothness': 1.0}
+    REWARD_WORKERS = 16
 
     writer = SummaryWriter(f'runs/pointnet_alpha_{training_version}_experiment')
     model = PointNetAlphaUNet().to(DEVICE)
@@ -174,14 +193,22 @@ def main():
             policy.scale = torch.ones_like(policy.loc) * current_std 
             sampled_alphas_dense = policy.sample()
 
-            batch_rewards = []
+            # 1. 准备任务列表，并将数据移动到CPU
+            tasks = []
             for i in range(points_dense.shape[0]):
-                sample_points = points_dense[i, mask[i]]
-                sample_alphas = sampled_alphas_dense[i, :, mask[i]].squeeze()
-                # 调用V8奖励函数
-                reward = calculate_reconstruction_reward_v8_alphashape(sample_alphas, sample_points, REWARD_WEIGHTS, DEVICE)
-                batch_rewards.append(reward)
-            rewards_tensor = torch.stack(batch_rewards)
+                sample_points = points_dense[i, mask[i]].cpu()
+                sample_alphas = sampled_alphas_dense[i, :, mask[i]].squeeze().cpu()
+                tasks.append((sample_alphas, sample_points, REWARD_WEIGHTS))
+            
+            # 2. 使用进程池并行执行任务
+            # 我们在主函数开头创建一次进程池，避免重复创建开销
+            # （更好的做法是在main函数外定义一个全局的pool，或者在循环外创建）
+            # 为了简单起见，我们暂时在这里创建
+            with multiprocessing.Pool(processes=REWARD_WORKERS) as pool:
+                results = pool.map(calculate_reconstruction_reward_v8_cpu, tasks)
+            
+            # 3. 将结果收集起来，并移动回GPU
+            rewards_tensor = torch.stack(results).to(DEVICE)
 
             rewards_tensor.clamp_(-20, 0)
             avg_reward = rewards_tensor.mean().item()
