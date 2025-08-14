@@ -33,7 +33,6 @@ os.makedirs(save_directory, exist_ok=True)
 
 # --- 2. 模型架构 (SDF Network - 保持不变) ---
 class PointNetSDF(nn.Module):
-    # ... (此处省略与之前完全相同的模型代码) ...
     def __init__(self, scene_feature_dim=256, mlp_hidden_dim=256):
         super().__init__()
         self.sa1_mlp = self._create_mlp(3 + 3, [64, 128])
