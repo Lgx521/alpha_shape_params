@@ -8,9 +8,11 @@ import os
 import glob
 from torch.utils.tensorboard import SummaryWriter
 
-training_version = 'v6_2'
+training_version = 'v6_5'
 '''
 This version v6 2 added advantage normalization
+v6 3 changed reward limits: -20 --> 100 没成功
+v6 4 changed reward limits: -15 --> 50
 '''
 
 # --- 1. 核心依賴導入 ---
@@ -230,7 +232,7 @@ def main():
 
     REWARD_WEIGHTS = {
         'w_correlation': 2.5,
-        'w_diversity': 0.1,
+        'w_diversity': 0.5,
         'w_magnitude': 0.2,
     }
 
@@ -281,7 +283,7 @@ def main():
                                                  K_NEIGHBORS_FOR_REWARD, 
                                                  REWARD_WEIGHTS, 
                                                  DEVICE)
-            rewards_tensor.clamp_(-5, 5)
+            rewards_tensor.clamp_(-15, 50)
             avg_reward = rewards_tensor.mean().item()
             advantage = rewards_tensor - reward_baseline
             advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
@@ -302,7 +304,7 @@ def main():
             progress_bar.set_postfix(loss=f"{loss.item():.4f}", avg_reward=f"{avg_reward:.4f}", baseline=f"{reward_baseline:.4f}")
 
             # --- Tensorboard 日誌 ---
-            if global_step % 20 == 0:
+            if global_step % 10 == 0:
                 writer.add_scalar('Loss/train', loss.item(), global_step)
                 writer.add_scalar('Reward/average_reward', avg_reward, global_step)
                 writer.add_scalar('Reward/baseline', reward_baseline, global_step)
