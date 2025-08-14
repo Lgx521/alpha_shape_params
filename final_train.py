@@ -8,12 +8,13 @@ import os
 import glob
 from torch.utils.tensorboard import SummaryWriter
 
-training_version = 'v6_5'
+training_version = 'v6_6'
 '''
 This version v6 2 added advantage normalization
 v6 3 changed reward limits: -20 --> 100 没成功
-v6 4 changed reward limits: -15 --> 50
+v6 4 changed reward limits: -15 --> 50  没成功
 v6 5 changed reward limits: -5 --> 10
+v6 6 batch size --> 128
 '''
 
 # --- 1. 核心依賴導入 ---
@@ -224,7 +225,7 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
     NUM_POINTS = 2048
-    BATCH_SIZE = 256  # 可以適當調大，因為數據加載很快
+    BATCH_SIZE = 128  # 可以適當調大，因為數據加載很快
     LEARNING_RATE = 1e-4
     EPOCHS = 50
     REWARD_BASELINE_DECAY = 0.95
