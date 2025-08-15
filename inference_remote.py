@@ -71,8 +71,8 @@ class PyGShapeNetDataset(Dataset):
 # ==============================================================================
 training_version = 'v14_SDF_RL_correct'
 CHECKPOINT_EPOCH = 200
-SAMPLE_INDICES = [100, 250, 500, 1024, 2048]
-RESOLUTION = 128
+SAMPLE_INDICES = [1200]
+RESOLUTION = 256
 OUTPUT_DIR = f"inference_results"
 VIEWPOINTS = {
     "front": {"lookat": [0, 0, 0], "front": [0, 1.5, 0.2], "up": [0, 0, 1], "zoom": 0.8},
