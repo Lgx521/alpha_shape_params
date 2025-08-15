@@ -73,7 +73,7 @@ training_version = 'v14_SDF_RL_correct'
 CHECKPOINT_EPOCH = 30
 SAMPLE_INDICES = [100, 250, 500, 1024, 2048]
 RESOLUTION = 128
-OUTPUT_DIR = f"inference_results_{training_version}"
+OUTPUT_DIR = f"inference_results"
 VIEWPOINTS = {
     "front": {"lookat": [0, 0, 0], "front": [0, 1.5, 0.2], "up": [0, 0, 1], "zoom": 0.8},
     "top_down": {"lookat": [0, 0, 0], "front": [0, 0.1, 2], "up": [0, 1, 0], "zoom": 0.8},
@@ -142,21 +142,48 @@ def main():
         original_pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(original_points))
         original_pcd.paint_uniform_color([1, 0, 0])
 
+        # ==============================================================================
+        # --- [修正] 渲染部分：使用 OffscreenRenderer 替换 Visualizer ---
+        # ==============================================================================
+        # 为了渲染，我们需要为网格和点云定义“材质”
+        mat = o3d.visualization.rendering.MaterialRecord()
+        mat.shader = "defaultLit"
+        mat.base_color = [0.7, 0.7, 0.7, 1.0] # 灰色网格
+
+        pcd_mat = o3d.visualization.rendering.MaterialRecord()
+        pcd_mat.shader = "defaultUnlit" # 点云通常用无光照材质
+        pcd_mat.base_color = [1.0, 0.0, 0.0, 1.0] # 红色点云
+        pcd_mat.point_size = 3.0 # 可以设置点的大小
+
+        # 初始化离屏渲染器
+        renderer = o3d.visualization.rendering.OffscreenRenderer(RESOLUTION * 2, RESOLUTION * 2) # 可以设置更高的分辨率
+
         for view_name, view_params in VIEWPOINTS.items():
-            print(f"正在从 '{view_name}' 视角渲染...")
-            vis = o3d.visualization.Visualizer()
-            vis.create_window(visible=False)
-            vis.add_geometry(reconstructed_mesh)
-            vis.add_geometry(original_pcd)
-            ctr = vis.get_view_control()
-            ctr.set_lookat(view_params["lookat"])
-            ctr.set_front(view_params["front"])
-            ctr.set_up(view_params["up"])
-            ctr.set_zoom(view_params["zoom"])
-            output_path = os.path.join(OUTPUT_DIR, f"recon_sample_{sample_idx}_view_{view_name}.png")
-            vis.capture_screen_image(output_path, do_render=True)
-            vis.destroy_window()
+            print(f"正在从 '{view_name}' 视角进行离屏渲染...")
+
+            # 设置场景和相机
+            renderer.scene.clear_geometry()
+            renderer.scene.add_geometry("reconstructed_mesh", reconstructed_mesh, mat)
+            renderer.scene.add_geometry("original_pcd", original_pcd, pcd_mat)
+
+            # set_camera_properties 的参数与你的 VIEWPOINTS 有一点不同，需要转换
+            # lookat(center), eye(front), up
+            renderer.scene.camera.look_at(
+                view_params["lookat"], # center
+                view_params["front"],  # eye
+                view_params["up"]      # up
+            )
+            # 缩放可以通过调整相机视场角(fov)或距离来实现，这里我们保持默认
+
+            # 渲染为图像
+            rendered_image = renderer.render_to_image()
+
+            # 保存图像
+            output_path = os.path.join(OUTPUT_DIR, f"recon_sample_{sample_idx}_view_{view_name}__{training_version}.png")
+            o3d.io.write_image(output_path, rendered_image)
+
             print(f"  -> 已保存至 {output_path}")
+
     print("\n所有推理任务完成！")
 
 if __name__ == '__main__':
