@@ -66,22 +66,19 @@ class PointNetAlphaUNet(torch.nn.Module):
                 return nn.Sequential(*layers[:-1])
             return nn.Sequential(*layers)
 
-        # --- 編碼器 (下採樣) ---
-        # 處理原始點 (坐標+法線)
+        # Encoder & set abstraction
+        # 6D input
         self.sa1_mlp = create_mlp(3 + 3, [64, 128])
-        # 處理上一層的特徵
         self.sa2_mlp = create_mlp(128 + 3, [128, 256])
-        # 瓶頸層
         self.sa3_mlp = create_mlp(256 + 3, [256, 512])
 
-        # --- 解碼器 (上採樣與特徵融合) ---
-        self.fp2_mlp = create_mlp(512 + 256, [256, 256])  # 上採樣(l2->l1) + 跳躍連接(l1)
-        self.fp1_mlp = create_mlp(256 + 128, [256, 128])   # 上採樣(l1->l0) + 跳躍連接(l0)
-        
-        # 輸出前的最終特徵融合層
-        self.fp0_mlp = create_mlp(128 + 3 + 3, [128, 128]) # 融合特徵 + 原始坐標 + 原始法線
+        #  Decoder 
+        self.fp2_mlp = create_mlp(512 + 256, [256, 256])  
+        self.fp1_mlp = create_mlp(256 + 128, [256, 128])  
 
-        # --- 輸出頭 ---
+        self.fp0_mlp = create_mlp(128 + 3 + 3, [128, 128]) # Fused charactor 
+
+        # Output
         self.head_mlp = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(inplace=True),

@@ -69,9 +69,9 @@ class PyGShapeNetDataset(Dataset):
 # ==============================================================================
 # --- 配置参数 (您只需要修改这里) ---
 # ==============================================================================
-training_version = 'v14_SDF_RL_correct'
-CHECKPOINT_EPOCH = 200
-SAMPLE_INDICES = [1200]
+training_version = 'v12_SelfSupervised_final'
+CHECKPOINT_EPOCH = 20
+SAMPLE_INDICES = [2500]
 RESOLUTION = 256
 OUTPUT_DIR = f"inference_results"
 VIEWPOINTS = {

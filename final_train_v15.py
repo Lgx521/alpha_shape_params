@@ -11,7 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 # ==============================================================================
 # --- 版本与实验配置 ---
 # ==============================================================================
-training_version = 'v15'
+training_version = 'v17'
 '''
 版本历史:
 v13: 尝试融合RL与SDF，但因奖励尺度计算错误而失败。
@@ -22,6 +22,7 @@ v15: 最终修正版。
     - 彻底修复了所有已知的bug，特别是函数参数不匹配的问题。
     - 简化了奖励函数逻辑，使其更清晰、更健壮。
     - 这是经过严格审查的、保证可运行的最终版本。
+v17: 解决懒散学习问题
 '''
 
 # --- 1. 核心依赖导入 ---
@@ -85,25 +86,20 @@ class PyGShapeNetDataset(Dataset):
         except Exception as e:
             return self.__getitem__((idx + 1) % len(self))
 
-# --- 4. 奖励函数 (v15 - 最终修正版) ---
-def calculate_sdf_reward_v15_final(model, scene_feature, predicted_sdf, query_points, weights):
-    B, num_total_queries, _ = query_points.shape
-    num_surface = num_total_queries // 2
-    
-    surface_pred_sdf = predicted_sdf[:, :num_surface]
-    
-    # 奖励A: 表面一致性
+# --- 4. 奖励函数 (V17 - 解耦约束的最终版) ---
+def calculate_sdf_reward_v17_decoupled(surface_pred_sdf, near_surface_pred_sdf, near_surface_queries, weights):
+    # 奖励A: 表面一致性 (只作用于表面点)
     reward_fidelity = -F.l1_loss(surface_pred_sdf, torch.zeros_like(surface_pred_sdf), reduction='none').mean(dim=[1, 2])
 
-    # 奖励B: Eikonal 正则化
-    eikonal_queries = query_points.clone().requires_grad_()
-    with torch.enable_grad():
-        eikonal_pred_sdf = model.query_sdf(scene_feature, eikonal_queries)
-    
-    grad_outputs = torch.ones_like(eikonal_pred_sdf, requires_grad=False)
+    # 奖励B: Eikonal 正则化 (只作用于近表面点)
+    grad_outputs = torch.ones_like(near_surface_pred_sdf, requires_grad=False)
     gradients = torch.autograd.grad(
-        outputs=eikonal_pred_sdf, inputs=eikonal_queries,
-        grad_outputs=grad_outputs, create_graph=True, retain_graph=True, only_inputs=True
+        outputs=near_surface_pred_sdf, 
+        inputs=near_surface_queries,
+        grad_outputs=grad_outputs, 
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
     )[0]
     
     grad_norm = gradients.norm(dim=-1)
@@ -111,9 +107,10 @@ def calculate_sdf_reward_v15_final(model, scene_feature, predicted_sdf, query_po
 
     total_reward = (weights['w_fidelity'] * reward_fidelity +
                     weights['w_eikonal'] * reward_eikonal)
+    
     return total_reward
 
-# --- 5. 训练主函数 (适配v15) ---
+# --- 5. 训练主函数 (V17 - 最终修正版) ---
 def main():
     # --- 超参数配置 ---
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -123,7 +120,7 @@ def main():
     EPOCHS = 200
     REWARD_BASELINE_DECAY = 0.98
     
-    REWARD_WEIGHTS = { 'w_fidelity': 5.0, 'w_eikonal': 1.0 }
+    REWARD_WEIGHTS = { 'w_fidelity': 10.0, 'w_eikonal': 0.1 } # Eikonal权重可以调回一个较小的值
     NUM_QUERY_POINTS_PER_SAMPLE = 2048 * 2
 
     writer = SummaryWriter(f'runs/pointnet_alpha_{training_version}_experiment')
@@ -148,7 +145,7 @@ def main():
 
             scene_feature = model.encode_scene(batch_data)
             
-            # --- 采样查询点 (V15/v15 鲁棒采样策略) ---
+            # --- 采样查询点 (保持V15/V16的鲁棒策略) ---
             num_surface = NUM_QUERY_POINTS_PER_SAMPLE // 2
             num_near_surface = NUM_QUERY_POINTS_PER_SAMPLE - num_surface
             surface_queries_list = []
@@ -168,20 +165,30 @@ def main():
             perturbations = torch.randn(B, num_near_surface, 3, device=DEVICE) * 0.05
             base_points_for_perturb = surface_queries[:, torch.randint(0, num_surface, (num_near_surface,)), :]
             near_surface_queries = base_points_for_perturb + perturbations
-            query_points = torch.cat([surface_queries, near_surface_queries], dim=1)
             
             # --- 强化学习框架 ---
-            predicted_sdf = model.query_sdf(scene_feature, query_points)
-            
-            rewards_tensor = calculate_sdf_reward_v15_final(model, scene_feature.detach(), predicted_sdf, query_points, REWARD_WEIGHTS)
+            # 动作1: 预测表面点的SDF
+            surface_pred_sdf = model.query_sdf(scene_feature, surface_queries)
+            # 动作2: 预测近表面点的SDF (用于Eikonal)
+            near_surface_queries.requires_grad = True # 必须设置，才能计算梯度
+            near_surface_pred_sdf = model.query_sdf(scene_feature, near_surface_queries)
+
+            # [核心修正] rewards_tensor现在是正确的 [B] 形状
+            rewards_tensor = calculate_sdf_reward_v17_decoupled(surface_pred_sdf, near_surface_pred_sdf, near_surface_queries, REWARD_WEIGHTS)
             avg_reward = rewards_tensor.mean().item()
             
             advantage = rewards_tensor - reward_baseline
             
-            policy = Normal(predicted_sdf, 0.1)
-            log_probs = policy.log_prob(predicted_sdf.detach())
-            
-            loss = -(log_probs * advantage.view(-1, 1, 1)).mean()
+            # 损失函数现在分别计算，然后相加
+            policy_surface = Normal(surface_pred_sdf, 0.1)
+            log_probs_surface = policy_surface.log_prob(surface_pred_sdf.detach())
+            loss_surface = -(log_probs_surface * advantage.view(-1, 1, 1)).mean()
+
+            policy_near = Normal(near_surface_pred_sdf, 0.1)
+            log_probs_near = policy_near.log_prob(near_surface_pred_sdf.detach())
+            loss_near = -(log_probs_near * advantage.view(-1, 1, 1)).mean()
+
+            loss = loss_surface + loss_near
 
             optimizer.zero_grad()
             loss.backward()
