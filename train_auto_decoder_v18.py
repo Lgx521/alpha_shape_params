@@ -113,9 +113,9 @@ def main():
     # --- 超参数配置 ---
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     SHAPENET_PATH = "./ShapeNetCore.v2/ShapeNetCore.v2"
-    BATCH_SIZE = 32
+    BATCH_SIZE = 256
     LEARNING_RATE = 1e-4
-    EPOCHS = 500 # 自解码器预训练需要更多轮次来优化每个隐编码
+    EPOCHS = 100 # 自解码器预训练需要更多轮次来优化每个隐编码
     
     LOSS_WEIGHTS = { 'w_fidelity': 1.0, 'w_eikonal': 0.1 }
     NUM_QUERY_POINTS_PER_SAMPLE = 4096
@@ -179,7 +179,7 @@ def main():
         
         scheduler.step()
         
-        if (epoch + 1) % 50 == 0 or (epoch + 1) == EPOCHS:
+        if (epoch + 1) % 10 == 0 or (epoch + 1) == EPOCHS:
             # 保存整个模型，它同时包含了SDF解码器权重和训练好的隐编码“密码本”
             save_file_name = f"autodecoder_{training_version}_epoch_{epoch+1}.pth"
             save_path = os.path.join(save_directory, save_file_name)
