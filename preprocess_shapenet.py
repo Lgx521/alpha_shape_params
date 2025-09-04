@@ -8,7 +8,7 @@ from pytorch3d.ops import sample_points_from_meshes
 from pytorch3d.structures import Meshes
 
 # --- 配置您的路徑 ---
-SHAPENET_ROOT = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2" # 您的ShapeNet數據集根目錄
+SHAPENET_ROOT = "./ShapeNetCore.v2/ShapeNetCore.v2" # 您的ShapeNet數據集根目錄
 OUTPUT_DIR = os.path.join(SHAPENET_ROOT, "processed_points_with_normals") # 預處理數據的存放位置
 NUM_POINTS = 2048 # 採樣點數，與訓練時保持一致
 

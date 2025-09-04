@@ -112,7 +112,7 @@ def calculate_sdf_loss_v12_final(model, shape_indices, query_points, weights):
 def main():
     # --- 超参数配置 ---
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
+    SHAPENET_PATH = "./ShapeNetCore.v2/ShapeNetCore.v2"
     BATCH_SIZE = 32
     LEARNING_RATE = 1e-4
     EPOCHS = 500 # 自解码器预训练需要更多轮次来优化每个隐编码
@@ -120,7 +120,7 @@ def main():
     LOSS_WEIGHTS = { 'w_fidelity': 1.0, 'w_eikonal': 0.1 }
     NUM_QUERY_POINTS_PER_SAMPLE = 4096
 
-    writer = SummaryWriter(f'runs/pointnet_alpha_{training_version}_experiment')
+    writer = SummaryWriter(f'./runs/pointnet_alpha_{training_version}_experiment')
     
     dataset = PyGShapeNetDatasetWithIdx(root_dir=SHAPENET_PATH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=16)
