@@ -7,13 +7,15 @@ from tqdm import tqdm
 import os
 
 # [重要] 确保这里的模型定义和数据加载器与您的训练脚本完全一致
-from final_train_v14_SDF_RL_correct import PointNetSDF, PyGShapeNetDataset
+# from final_train_v14_SDF_RL_correct import PointNetSDF, PyGShapeNetDataset
+from train_auto_decoder_v18 import SDFAutoDecoder, PyGShapeNetDatasetWithIdx as PointNetSDF, PyGShapeNetDataset
 
 # --- 配置 ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-SHAPENET_PATH = "/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2"
+SHAPENET_PATH = "./ShapeNetCore.v2/ShapeNetCore.v2"
 # 选择一个您训练好的模型权重文件
-CHECKPOINT_PATH = "/root/autodl-tmp/code/checkpoints_v14_SDF_RL_correct/pointnet_sdf_v14_SDF_RL_correct_epoch_30.pth"
+# CHECKPOINT_PATH = "/root/autodl-tmp/code/checkpoints_v14_SDF_RL_correct/pointnet_sdf_v14_SDF_RL_correct_epoch_30.pth"
+CHECKPOINT_PATH = '/home/sgan/alpha_shape_params/checkpoints_v18/autodecoder_v18_epoch_100.pth'
 # 选择一个测试样本的索引
 SAMPLE_IDX = 100 
 # 重建的分辨率 (64对于快速预览足够了, 128或256可以获得更精细的结果)

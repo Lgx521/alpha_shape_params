@@ -156,7 +156,7 @@ def get_mesh_from_sdf(model, shape_idx, device, resolution=128, batch_size=65536
 
 def main():
     parser = argparse.ArgumentParser(description="SDF自解码器模型重建与可视化脚本")
-    parser.add_argument('--checkpoint', type=str, default="/home/sgan/alpha_shape_params/checkpoints_v18/autodecoder_v18_epoch_100.pth", help="训练好的模型检查点文件路径 (.pth)")
+    parser.add_argument('--checkpoint', type=str, default="/home/sgan/alpha_shape_params/checkpoints_v18/autodecoder_v18_epoch_10.pth", help="训练好的模型检查点文件路径 (.pth)")
     parser.add_argument('--shapenet_path', type=str, default="./ShapeNetCore.v2/ShapeNetCore.v2", help="ShapeNet数据集根目录")
     parser.add_argument('--shape_idx', type=int, default=10, help="要可视化的数据在数据集中的索引")
     parser.add_argument('--resolution', type=int, default=128, help="Marching Cubes算法的分辨率")

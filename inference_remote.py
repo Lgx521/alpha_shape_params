@@ -69,8 +69,8 @@ class PyGShapeNetDataset(Dataset):
 # ==============================================================================
 # --- 配置参数 (您只需要修改这里) ---
 # ==============================================================================
-training_version = 'v12_SelfSupervised_final'
-CHECKPOINT_EPOCH = 20
+training_version = 'v18'
+CHECKPOINT_EPOCH = 100
 SAMPLE_INDICES = [2500]
 RESOLUTION = 256
 OUTPUT_DIR = f"inference_results"
@@ -85,9 +85,15 @@ VIEWPOINTS = {
 # ==============================================================================
 def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))
     checkpoint_dir = os.path.join(project_root, f'checkpoints_{training_version}')
-    checkpoint_path = os.path.join(checkpoint_dir, f"pointnet_sdf_{training_version}_epoch_{CHECKPOINT_EPOCH}.pth")
+    # checkpoint_path = os.path.join(checkpoint_dir, f"pointnet_sdf_{training_version}_epoch_{CHECKPOINT_EPOCH}.pth")
+    checkpoint_path = os.path.join(checkpoint_dir, f"autodecoder_{training_version}_epoch_{CHECKPOINT_EPOCH}.pth")
+
+    # print(project_root)
+    # print(checkpoint_dir)
+    # print(checkpoint_path)
+
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     model = PointNetSDF().to(DEVICE)
@@ -99,7 +105,7 @@ def main():
     model.eval()
     print(f"模型已从 {checkpoint_path} 加载。")
 
-    dataset = PyGShapeNetDataset(root_dir="/root/autodl-tmp/dataset/ShapeNetCore.v2/ShapeNetCore.v2", split='test')
+    dataset = PyGShapeNetDataset(root_dir="./ShapeNetCore.v2/ShapeNetCore.v2", split='test')
 
     for sample_idx in SAMPLE_INDICES:
         print(f"\n--- 正在处理样本 {sample_idx} ---")
