@@ -3,3 +3,4 @@ cgal/
 pytorch3d/
 archive.zip
 ShapeNetCore.v2/
+checkpoints_*/
