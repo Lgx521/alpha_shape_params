@@ -150,7 +150,7 @@ def main():
     LEARNING_RATE = 1e-4
     EPOCHS = 100 # 自解码器预训练需要更多轮次来优化每个隐编码
     
-    LOSS_WEIGHTS = { 'w_fidelity': 1.0, 'w_eikonal': 0.1 }
+    LOSS_WEIGHTS = { 'w_fidelity': 1.0, 'w_eikonal': 0.1, 'w_l2' : 0.8 }
     NUM_QUERY_POINTS_PER_SAMPLE = 4096
 
     writer = SummaryWriter(f'./runs/pointnet_alpha_{training_version}_experiment')
