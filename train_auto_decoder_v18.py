@@ -10,10 +10,12 @@ from torch.utils.tensorboard import SummaryWriter
 # ==============================================================================
 # --- 版本与实验配置 ---
 # ==============================================================================
-training_version = 'v18'
+training_version = 'v19'
 '''
 V18 - 第一阶段: 自解码器预训练
 目标: 训练一个强大的SDF解码器，并为数据集中每个形状优化一个专属的隐编码。
+
+V19 - 增加L2 Norm
 '''
 
 # --- 核心依赖导入 ---
@@ -87,6 +89,27 @@ class PyGShapeNetDatasetWithIdx(Dataset):
             return self.__getitem__((idx + 1) % len(self))
 
 # --- 3. 损失函数 (自监督SDF损失 - 保持不变) ---
+# def calculate_sdf_loss_v12_final(model, shape_indices, query_points, weights):
+#     query_points.requires_grad = True
+#     predicted_sdf = model(shape_indices, query_points)
+    
+#     B, num_total_queries, _ = query_points.shape
+#     num_surface = num_total_queries // 2
+    
+#     surface_pred_sdf = predicted_sdf[:, :num_surface]
+    
+#     loss_fidelity = F.l1_loss(surface_pred_sdf, torch.zeros_like(surface_pred_sdf))
+
+#     grad_outputs = torch.ones_like(predicted_sdf)
+#     gradients = torch.autograd.grad(
+#         outputs=predicted_sdf, inputs=query_points,
+#         grad_outputs=grad_outputs, create_graph=True, retain_graph=True, only_inputs=True
+#     )[0]
+#     loss_eikonal = F.mse_loss(gradients.norm(dim=-1), torch.ones_like(gradients.norm(dim=-1)))
+
+#     total_loss = weights['w_fidelity'] * loss_fidelity + weights['w_eikonal'] * loss_eikonal
+#     return total_loss
+
 def calculate_sdf_loss_v12_final(model, shape_indices, query_points, weights):
     query_points.requires_grad = True
     predicted_sdf = model(shape_indices, query_points)
@@ -94,10 +117,11 @@ def calculate_sdf_loss_v12_final(model, shape_indices, query_points, weights):
     B, num_total_queries, _ = query_points.shape
     num_surface = num_total_queries // 2
     
+    # 1. Fidelity Loss (L1 norm on surface points)
     surface_pred_sdf = predicted_sdf[:, :num_surface]
-    
     loss_fidelity = F.l1_loss(surface_pred_sdf, torch.zeros_like(surface_pred_sdf))
 
+    # 2. Eikonal Loss (L2 norm of gradients)
     grad_outputs = torch.ones_like(predicted_sdf)
     gradients = torch.autograd.grad(
         outputs=predicted_sdf, inputs=query_points,
@@ -105,7 +129,16 @@ def calculate_sdf_loss_v12_final(model, shape_indices, query_points, weights):
     )[0]
     loss_eikonal = F.mse_loss(gradients.norm(dim=-1), torch.ones_like(gradients.norm(dim=-1)))
 
-    total_loss = weights['w_fidelity'] * loss_fidelity + weights['w_eikonal'] * loss_eikonal
+    # --- 3. L2 Regularization Loss (New Addition) ---
+    loss_l2 = 0.0
+    for param in model.parameters():
+        loss_l2 += torch.norm(param, p=2)**2
+    
+    # 4. Total Loss
+    total_loss = (weights['w_fidelity'] * loss_fidelity + 
+                  weights['w_eikonal'] * loss_eikonal +
+                  weights['w_l2'] * loss_l2)
+    
     return total_loss
 
 # --- 4. 训练主函数 (第一阶段) ---
